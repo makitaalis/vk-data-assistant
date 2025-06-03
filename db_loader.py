@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 import json
+import asyncio
 
 logger = logging.getLogger("db_loader")
 
@@ -100,6 +101,66 @@ class DatabaseLoader:
                         break
 
         return result
+
+    async def check_duplicates_in_batch(self, records: List[Dict[str, Any]]) -> Tuple[
+        List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Проверяет все записи на дубликаты и возвращает только уникальные
+
+        Returns:
+            Tuple[List[Dict], Dict]: (уникальные записи, статистика дубликатов)
+        """
+        # Собираем все ссылки и телефоны для проверки
+        all_links = []
+        all_phones = []
+
+        for record in records:
+            if record["link"] and not record["link"].startswith("phone:"):
+                all_links.append(record["link"])
+            all_phones.extend(record.get("phones", []))
+
+        # Убираем дубликаты в списках
+        unique_links = list(set(all_links))
+        unique_phones = list(set(all_phones))
+
+        # Проверяем дубликаты в БД
+        duplicate_data = await self.db.check_both_duplicates(unique_links, unique_phones)
+        duplicate_links = duplicate_data["duplicate_links"]
+        duplicate_phones = duplicate_data["duplicate_phones"]
+
+        # Фильтруем записи
+        unique_records = []
+        duplicate_stats = {
+            "total_checked": len(records),
+            "duplicate_by_link": 0,
+            "duplicate_by_phone": 0,
+            "duplicate_by_both": 0,
+            "unique": 0
+        }
+
+        for record in records:
+            link = record["link"]
+            phones = record.get("phones", [])
+
+            # Проверяем дубликаты
+            is_duplicate_link = link in duplicate_links
+            is_duplicate_phone = any(phone in duplicate_phones for phone in phones)
+
+            if is_duplicate_link and is_duplicate_phone:
+                duplicate_stats["duplicate_by_both"] += 1
+                logger.info(f"🔄 Дубликат по ссылке И телефону: {link}")
+            elif is_duplicate_link:
+                duplicate_stats["duplicate_by_link"] += 1
+                logger.info(f"🔄 Дубликат по ссылке: {link}")
+            elif is_duplicate_phone:
+                duplicate_stats["duplicate_by_phone"] += 1
+                logger.info(f"🔄 Дубликат по телефону: {link} - телефоны {phones}")
+            else:
+                # Это уникальная запись
+                unique_records.append(record)
+                duplicate_stats["unique"] += 1
+
+        return unique_records, duplicate_stats
 
     def process_excel_file(self, file_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
@@ -253,15 +314,31 @@ class DatabaseLoader:
         logger.info(f"📊 Обработано: {len(records)} записей")
 
         if not records:
-            return {"added": 0, "updated": 0, "errors": 0}
+            return {"added": 0, "updated": 0, "errors": 0, "duplicates": 0}
 
         # Фильтруем записи с настоящими VK ссылками для сохранения
         vk_records = [r for r in records if not r["link"].startswith("phone:")]
 
-        # Сохраняем в базу данных только записи с VK ссылками
-        db_stats = self.db.batch_save_results(vk_records, user_id, source="import")
+        # Проверяем дубликаты перед сохранением
+        unique_records, duplicate_stats = await self.check_duplicates_in_batch(vk_records)
 
-        logger.info(f"✅ Загружено в БД: добавлено {db_stats['added']}, обновлено {db_stats['updated']}")
+        logger.info(f"📊 Статистика дубликатов:")
+        logger.info(f"   Всего проверено: {duplicate_stats['total_checked']}")
+        logger.info(f"   Дубликаты по ссылке: {duplicate_stats['duplicate_by_link']}")
+        logger.info(f"   Дубликаты по телефону: {duplicate_stats['duplicate_by_phone']}")
+        logger.info(f"   Дубликаты по обоим: {duplicate_stats['duplicate_by_both']}")
+        logger.info(f"   Уникальных записей: {duplicate_stats['unique']}")
+
+        # Сохраняем в базу данных только уникальные записи
+        if unique_records:
+            db_stats = await self.db.batch_save_results(unique_records, user_id, source="import")
+            logger.info(f"✅ Загружено в БД: добавлено {db_stats['added']}, обновлено {db_stats['updated']}")
+        else:
+            db_stats = {"added": 0, "updated": 0, "errors": 0}
+            logger.info("⚠️ Нет уникальных записей для загрузки")
+
+        # Добавляем информацию о дубликатах в статистику
+        db_stats["duplicates"] = duplicate_stats['total_checked'] - duplicate_stats['unique']
 
         return db_stats
 

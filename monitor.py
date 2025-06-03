@@ -2,109 +2,123 @@
 """
 Скрипт мониторинга для VK Data Assistant Bot
 Показывает статистику использования и активность
+PostgreSQL версия
 """
 
-import sqlite3
+import asyncio
+import asyncpg
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import os
+from dotenv import load_dotenv
 
-# Путь к базе данных
-DB_PATH = Path("data") / "vk_data.db"
+# Загрузка конфигурации
+load_dotenv()
+
+# PostgreSQL конфигурация
+DB_CONFIG = {
+    "host": os.getenv("POSTGRES_HOST", "localhost"),
+    "port": int(os.getenv("POSTGRES_PORT", 5432)),
+    "database": os.getenv("POSTGRES_DB", "vk_data"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", ""),
+}
 
 
-def get_db_stats():
+async def get_db_stats():
     """Получить общую статистику из базы данных"""
-    if not DB_PATH.exists():
-        print("❌ База данных не найдена!")
-        return None
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-
     try:
-        # Общая статистика
-        total_stats = conn.execute("""
-            SELECT 
-                COUNT(DISTINCT link) as total_links,
-                COUNT(DISTINCT checked_by_user_id) as total_users,
-                SUM(CASE WHEN found_data = 1 THEN 1 ELSE 0 END) as with_data,
-                SUM(CASE WHEN found_data = 0 THEN 1 ELSE 0 END) as without_data
-            FROM vk_results
-        """).fetchone()
+        # Подключение к PostgreSQL
+        conn = await asyncpg.connect(**DB_CONFIG)
 
-        # Статистика по телефонам
-        phone_stats = conn.execute("""
-            SELECT 
-                COUNT(DISTINCT phone) as unique_phones,
-                COUNT(*) as total_phone_links,
-                (SELECT COUNT(DISTINCT phone) FROM (
-                    SELECT phone, COUNT(link) as cnt 
-                    FROM phone_links 
-                    GROUP BY phone 
-                    HAVING cnt > 1
-                )) as duplicate_phones
-            FROM phone_links
-        """).fetchone()
+        try:
+            # Общая статистика
+            total_stats = await conn.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT link) as total_links,
+                    COUNT(DISTINCT checked_by_user_id) as total_users,
+                    COUNT(*) FILTER (WHERE found_data = TRUE) as with_data,
+                    COUNT(*) FILTER (WHERE found_data = FALSE) as without_data
+                FROM vk_results
+            """)
 
-        # Статистика за последние 24 часа
-        daily_stats = conn.execute("""
-            SELECT 
-                COUNT(*) as checks_24h,
-                COUNT(DISTINCT checked_by_user_id) as active_users_24h
-            FROM vk_results
-            WHERE checked_at > datetime('now', '-1 day')
-        """).fetchone()
+            # Статистика по телефонам
+            phone_stats = await conn.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT phone) as unique_phones,
+                    COUNT(*) as total_phone_links,
+                    (SELECT COUNT(DISTINCT phone) FROM (
+                        SELECT phone, COUNT(link) as cnt 
+                        FROM phone_links 
+                        GROUP BY phone 
+                        HAVING COUNT(link) > 1
+                    ) t) as duplicate_phones
+                FROM phone_links
+            """)
 
-        # Топ пользователей
-        top_users = conn.execute("""
-            SELECT 
-                u.user_id,
-                u.username,
-                u.first_name,
-                COUNT(r.link) as total_checks,
-                SUM(CASE WHEN r.found_data = 1 THEN 1 ELSE 0 END) as found_data
-            FROM users u
-            LEFT JOIN vk_results r ON u.user_id = r.checked_by_user_id
-            GROUP BY u.user_id
-            ORDER BY total_checks DESC
-            LIMIT 10
-        """).fetchall()
+            # Статистика за последние 24 часа
+            daily_stats = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) as checks_24h,
+                    COUNT(DISTINCT checked_by_user_id) as active_users_24h
+                FROM vk_results
+                WHERE checked_at > NOW() - INTERVAL '1 day'
+            """)
 
-        # Топ телефонов с наибольшим количеством профилей
-        top_phones = conn.execute("""
-            SELECT phone, COUNT(link) as profile_count
-            FROM phone_links
-            GROUP BY phone
-            ORDER BY profile_count DESC
-            LIMIT 5
-        """).fetchall()
+            # Топ пользователей
+            top_users = await conn.fetch("""
+                SELECT 
+                    u.user_id,
+                    u.username,
+                    u.first_name,
+                    COUNT(r.link) as total_checks,
+                    COUNT(r.link) FILTER (WHERE r.found_data = TRUE) as found_data
+                FROM users u
+                LEFT JOIN vk_results r ON u.user_id = r.checked_by_user_id
+                GROUP BY u.user_id, u.username, u.first_name
+                ORDER BY total_checks DESC
+                LIMIT 10
+            """)
 
-        # Последние действия
-        recent_actions = conn.execute("""
-            SELECT 
-                user_id,
-                action,
-                details,
-                timestamp
-            FROM action_logs
-            ORDER BY timestamp DESC
-            LIMIT 20
-        """).fetchall()
+            # Топ телефонов с наибольшим количеством профилей
+            top_phones = await conn.fetch("""
+                SELECT phone, COUNT(link) as profile_count
+                FROM phone_links
+                GROUP BY phone
+                ORDER BY profile_count DESC
+                LIMIT 5
+            """)
 
-        return {
-            "total": dict(total_stats),
-            "phones": dict(phone_stats) if phone_stats else {"unique_phones": 0, "total_phone_links": 0,
-                                                             "duplicate_phones": 0},
-            "daily": dict(daily_stats),
-            "top_users": [dict(user) for user in top_users],
-            "top_phones": [dict(phone) for phone in top_phones] if top_phones else [],
-            "recent_actions": [dict(action) for action in recent_actions]
-        }
+            # Последние действия
+            recent_actions = await conn.fetch("""
+                SELECT 
+                    user_id,
+                    action,
+                    details,
+                    timestamp
+                FROM action_logs
+                ORDER BY timestamp DESC
+                LIMIT 20
+            """)
 
-    finally:
-        conn.close()
+            return {
+                "total": dict(total_stats),
+                "phones": dict(phone_stats) if phone_stats else {"unique_phones": 0, "total_phone_links": 0,
+                                                                 "duplicate_phones": 0},
+                "daily": dict(daily_stats),
+                "top_users": [dict(user) for user in top_users],
+                "top_phones": [dict(phone) for phone in top_phones] if top_phones else [],
+                "recent_actions": [dict(action) for action in recent_actions]
+            }
+
+        finally:
+            await conn.close()
+
+    except Exception as e:
+        print(f"❌ Ошибка подключения к базе данных: {e}")
+        return None
 
 
 def print_stats(stats):
@@ -113,7 +127,7 @@ def print_stats(stats):
         return
 
     print("\n" + "=" * 60)
-    print("📊 VK DATA ASSISTANT - СТАТИСТИКА")
+    print("📊 VK DATA ASSISTANT - СТАТИСТИКА (PostgreSQL)")
     print("=" * 60)
 
     # Общая статистика
@@ -151,7 +165,7 @@ def print_stats(stats):
     # Последние действия
     print("\n📝 ПОСЛЕДНИЕ ДЕЙСТВИЯ:")
     for action in stats['recent_actions'][:10]:
-        timestamp = datetime.fromisoformat(action['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = action['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
         details = action['details'][:50] + "..." if len(action['details']) > 50 else action['details']
         print(f"   [{timestamp}] User {action['user_id']}: {action['action']} - {details}")
 
@@ -160,7 +174,7 @@ def print_stats(stats):
     print("=" * 60 + "\n")
 
 
-def continuous_monitor(interval=30):
+async def continuous_monitor(interval=30):
     """Непрерывный мониторинг с обновлением каждые N секунд"""
     import time
     import os
@@ -171,19 +185,24 @@ def continuous_monitor(interval=30):
     try:
         while True:
             os.system('clear' if os.name == 'posix' else 'cls')
-            stats = get_db_stats()
+            stats = await get_db_stats()
             print_stats(stats)
-            time.sleep(interval)
+            await asyncio.sleep(interval)
     except KeyboardInterrupt:
         print("\n\n👋 Мониторинг остановлен.")
 
 
-if __name__ == "__main__":
+async def main():
+    """Основная функция"""
     if len(sys.argv) > 1 and sys.argv[1] == "--continuous":
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-        continuous_monitor(interval)
+        await continuous_monitor(interval)
     else:
-        stats = get_db_stats()
+        stats = await get_db_stats()
         print_stats(stats)
         print("\n💡 Совет: используйте --continuous для непрерывного мониторинга")
         print("   Пример: python monitor.py --continuous 30")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -6,8 +6,8 @@ import os
 import pathlib
 import re
 import tempfile
-from collections import defaultdict, OrderedDict
-from typing import Dict, Any, List, Set, Tuple, Optional
+from collections import OrderedDict
+from typing import Dict, Any, List, Optional
 
 import pandas as pd
 import redis.asyncio as redis
@@ -53,7 +53,7 @@ redis_client: Optional[redis.Redis] = None
 load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id]
+ADMIN_IDS = [int(admin_id) for admin_id in os.environ.get("ADMIN_IDS", "").split(",") if admin_id]
 
 # ───────────────────────────  Современные сообщения  ─────────────────────────
 
@@ -221,7 +221,25 @@ MESSAGES = {
 - Полное имя (опционально)
 - Дата рождения (опционально)
 
+⚠️ <b>Важно:</b> Строки с дубликатами по ссылке ИЛИ телефону будут пропущены!
+
 <i>Ожидаю файлы для загрузки...</i>
+""",
+
+    "db_load_complete": """
+✅ <b>Загрузка базы данных завершена!</b>
+
+📊 <b>Статистика загрузки:</b>
+- Файлов обработано: {files_count}
+- Записей добавлено: {added}
+- Записей обновлено: {updated}
+- Дубликатов пропущено: {duplicates}
+- Ошибок: {errors}
+
+💾 <b>Общая статистика БД:</b>
+- Всего записей: {total_records}
+- С данными: {with_data}
+- Без данных: {without_data}
 """,
 
     "file_action_prompt": """
@@ -281,21 +299,6 @@ MESSAGES = {
 {items}
 """,
 
-    "db_load_complete": """
-✅ <b>Загрузка базы данных завершена!</b>
-
-📊 <b>Статистика загрузки:</b>
-- Файлов обработано: {files_count}
-- Записей добавлено: {added}
-- Записей обновлено: {updated}
-- Ошибок: {errors}
-
-💾 <b>Общая статистика БД:</b>
-- Всего записей: {total_records}
-- С данными: {with_data}
-- Без данных: {without_data}
-""",
-
     "user_stats": """
 📊 <b>Ваша статистика</b>
 
@@ -351,6 +354,15 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+def back_to_menu_kb() -> InlineKeyboardMarkup:
+    """Клавиатура для возврата в главное меню"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        ]
+    )
+
+
 def processing_menu_kb() -> InlineKeyboardMarkup:
     """Меню во время обработки"""
     return InlineKeyboardMarkup(
@@ -391,21 +403,6 @@ def finish_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="➕ Добавить еще ссылки", callback_data="add_more"),
                 InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")
-            ]
-        ]
-    )
-
-
-def upload_file_menu_kb() -> InlineKeyboardMarkup:
-    """Меню для работы с файлами"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📤 Обработать файл", callback_data="process_file"),
-                InlineKeyboardButton(text="🔍 Анализ файла", callback_data="analyze_file")
-            ],
-            [
-                InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
             ]
         ]
     )
@@ -458,6 +455,17 @@ def analysis_results_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="💾 Скачать отчет", callback_data="export_analysis"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_file")
+            ]
+        ]
+    )
+
+
+def db_load_menu_kb() -> InlineKeyboardMarkup:
+    """Меню режима загрузки БД"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel_db_load")
             ]
         ]
     )
@@ -525,9 +533,9 @@ async def check_user_accepted_disclaimer(user_id: int) -> bool:
         try:
             accepted = await redis_client.get(f"disclaimer:{user_id}")
             return accepted == "1"
-        except:
+        except Exception:
             pass
-    return db.check_user_accepted_disclaimer(user_id)
+    return await db.check_user_accepted_disclaimer(user_id)
 
 
 async def set_user_accepted_disclaimer(user_id: int):
@@ -535,27 +543,28 @@ async def set_user_accepted_disclaimer(user_id: int):
     if redis_client:
         try:
             await redis_client.setex(f"disclaimer:{user_id}", 2592000, "1")  # 30 дней
-        except:
+        except Exception:
             pass
-    db.set_user_accepted_disclaimer(user_id)
-
-
-def db_load_menu_kb() -> InlineKeyboardMarkup:
-    """Меню режима загрузки БД"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="❌ Отменить загрузку", callback_data="cancel_db_load")
-            ]
-        ]
-    )
+    await db.set_user_accepted_disclaimer(user_id)
 
 
 # ───────────────────────────  Хелперы  ────────────────────────────────────
 
+
 def create_progress_bar(current: int, total: int, length: int = 10) -> str:
+    """Создает визуальный прогресс-бар"""
+    if total == 0:
+        return "⬜" * length
+
+    filled = int((current / total) * length)
+    empty = length - filled
+
+    bar = "🟩" * filled + "⬜" * empty
+    return bar
+
+
+async def analyze_file_inline(file_path: pathlib.Path) -> Dict[str, Any]:
     """Анализ файла внутри бота"""
-    from db_loader import DatabaseLoader
     loader = DatabaseLoader(db)
 
     # Базовый анализ структуры
@@ -574,9 +583,9 @@ def create_progress_bar(current: int, total: int, length: int = 10) -> str:
         all_phones.update(r.get('phones', []))
 
     # Проверка дубликатов
-    duplicate_vk = db.check_duplicates(all_vk_links) if all_vk_links else {"new": [], "duplicates_with_data": {},
+    duplicate_vk = await db.check_duplicates_extended(all_vk_links) if all_vk_links else {"new": [], "duplicates_with_data": {},
                                                                            "duplicates_no_data": []}
-    duplicate_phones = db.check_phone_duplicates(list(all_phones)) if all_phones else {}
+    duplicate_phones = await db.check_phone_duplicates(list(all_phones)) if all_phones else {}
 
     # Генерация рекомендаций
     recommendations = generate_analysis_recommendations(stats, network, duplicate_vk, duplicate_phones)
@@ -756,18 +765,6 @@ async def export_analysis_json(analysis: Dict, chat_id: int, bot: Bot) -> bool:
         return False
 
 
-def create_progress_bar(current: int, total: int, length: int = 10) -> str:
-    """Создает визуальный прогресс-бар"""
-    if total == 0:
-        return "⬜" * length
-
-    filled = int((current / total) * length)
-    empty = length - filled
-
-    bar = "🟩" * filled + "⬜" * empty
-    return bar
-
-
 def format_time() -> str:
     """Форматирует текущее время"""
     return datetime.datetime.now().strftime("%H:%M:%S")
@@ -878,7 +875,7 @@ async def create_excel_from_results(all_results: Dict[str, Dict[str, Any]], link
                     try:
                         if cell.value and len(str(cell.value)) > max_length:
                             max_length = len(str(cell.value))
-                    except:
+                    except Exception:
                         pass
                 adjusted_width = min(max_length + 2, 50)
                 if adjusted_width > 0:
@@ -955,7 +952,7 @@ async def cmd_help(msg: types.Message):
 @router.message(Command("stats"))
 async def cmd_user_stats(msg: types.Message):
     user_id = msg.from_user.id
-    stats = db.get_user_statistics(user_id)
+    stats = await db.get_user_statistics(user_id)
 
     efficiency = 0
     if stats["total_checked"] > 0:
@@ -1074,7 +1071,7 @@ async def cmd_find_phone(msg: types.Message):
         return
 
     # Поиск в базе
-    results = db.find_links_by_phone(phone)
+    results = await db.find_links_by_phone(phone)
 
     if not results:
         await msg.answer(
@@ -1145,7 +1142,7 @@ async def on_help(call: CallbackQuery):
 async def on_user_stats(call: CallbackQuery):
     await call.answer()
     user_id = call.from_user.id
-    stats = db.get_user_statistics(user_id)
+    stats = await db.get_user_statistics(user_id)
 
     efficiency = 0
     if stats["total_checked"] > 0:
@@ -1416,7 +1413,7 @@ async def on_analyze_only(call: CallbackQuery):
             )
         )
 
-        analysis = await analyze_file_inline(file_path, db)
+        analysis = await analyze_file_inline(file_path)
 
         # Шаг 2: Поиск телефонов
         await progress_msg.edit_text(
@@ -1483,7 +1480,7 @@ async def on_process_only(call: CallbackQuery):
     await call.message.edit_text(f"📤 Начинаю обработку {len(links)} ссылок...")
 
     # Проверяем дубликаты
-    duplicate_check = db.check_duplicates(links)
+    duplicate_check = await db.check_duplicates_extended(links)
 
     # Запускаем обработку
     await start_processing(call.message, links, processor, duplicate_check, user_id)
@@ -1702,7 +1699,7 @@ async def start_processing(
     """Запускает обработку ссылок с учетом кеша"""
 
     # Получаем закешированные результаты
-    cached_results = db.get_cached_results(links_to_process)
+    cached_results = await db.get_cached_results(links_to_process)
 
     # Определяем, какие ссылки нужно проверить через VK
     links_to_check = [link for link in links_to_process if link not in cached_results]
@@ -1710,7 +1707,6 @@ async def start_processing(
     # Статус-сообщение
     total = len(links_to_process)
     from_cache = len(cached_results)
-    to_check = len(links_to_check)
 
     progress_bar = create_progress_bar(from_cache, total)
     status_text = MESSAGES["processing_with_cache"].format(
@@ -1750,7 +1746,7 @@ async def start_processing(
         all_results[link] = result_data
 
         # Сохраняем в базу данных
-        db.save_result(link, result_data, user_id)
+        await db.save_result(link, result_data, user_id)
 
         new_checks_count += 1
         processed = len(all_results)
@@ -1894,7 +1890,8 @@ async def on_document(msg: types.Message):
             "files_count": 0,
             "added": 0,
             "updated": 0,
-            "errors": 0
+            "errors": 0,
+            "duplicates": 0
         }
 
         status_msg = await msg.answer("🔄 Начинаю загрузку файлов в базу данных...")
@@ -1921,10 +1918,12 @@ async def on_document(msg: types.Message):
                 total_stats["added"] += stats["added"]
                 total_stats["updated"] += stats["updated"]
                 total_stats["errors"] += stats["errors"]
+                total_stats["duplicates"] += stats.get("duplicates", 0)
 
                 # Обновляем статус с информацией о связях
                 status_text = f"🔄 Обработано файлов: {total_stats['files_count']}\n"
-                status_text += f"Добавлено: {total_stats['added']}, Обновлено: {total_stats['updated']}\n\n"
+                status_text += f"Добавлено: {total_stats['added']}, Обновлено: {total_stats['updated']}\n"
+                status_text += f"Дубликатов пропущено: {total_stats['duplicates']}\n\n"
                 status_text += f"📊 Найдено связей:\n"
                 status_text += f"Телефонов с несколькими VK: {network_data['stats']['phones_with_multiple_vk']}\n"
                 status_text += f"VK с несколькими телефонами: {network_data['stats']['vk_with_multiple_phones']}"
@@ -1936,13 +1935,14 @@ async def on_document(msg: types.Message):
                 total_stats["errors"] += 1
 
         # Получаем общую статистику БД
-        db_stats = db.get_database_statistics()
+        db_stats = await db.get_database_statistics()
 
         # Показываем итоговый результат
         complete_text = MESSAGES["db_load_complete"].format(
             files_count=total_stats["files_count"],
             added=total_stats["added"],
             updated=total_stats["updated"],
+            duplicates=total_stats["duplicates"],
             errors=total_stats["errors"],
             total_records=db_stats["total_records"],
             with_data=db_stats["with_data"],
@@ -1985,7 +1985,7 @@ async def on_excel(msg: types.Message):
     try:
         df = pd.read_excel(path_in, nrows=1)
         total_rows = len(pd.read_excel(path_in))
-    except:
+    except Exception:
         total_rows = "неизвестно"
 
     # Показываем меню действий
@@ -2018,7 +2018,7 @@ async def on_text_message(msg: types.Message):
         # Валидация номера
         if len(phone) == 11 and phone.startswith('7'):
             # Поиск в базе
-            results = db.find_links_by_phone(phone)
+            results = await db.find_links_by_phone(phone)
 
             if not results:
                 await msg.answer(
@@ -2099,7 +2099,7 @@ async def error_handler(event: types.ErrorEvent):
                 f"🚨 Ошибка в боте:\n\n"
                 f"<code>{str(event.exception)[:1000]}</code>"
             )
-        except:
+        except Exception:
             pass
 
 
@@ -2110,9 +2110,9 @@ async def on_startup():
     # Инициализация структуры проекта
     init_project_structure()
 
-    # Выполняем миграцию БД если требуется
-    logger.info("🔄 Проверка и миграция базы данных...")
-    db.migrate_database()
+    # Инициализация базы данных PostgreSQL
+    logger.info("🔄 Инициализация PostgreSQL...")
+    await db.init()
 
     # Подключение к Redis
     await init_redis()
@@ -2127,7 +2127,7 @@ async def on_startup():
                 admin_id,
                 "✅ Бот запущен и готов к работе!"
             )
-        except:
+        except Exception:
             pass
 
     logger.info("✅ Бот успешно запущен")
@@ -2138,6 +2138,9 @@ async def on_shutdown():
     # Закрываем соединение с Redis
     if redis_client:
         await redis_client.close()
+
+    # Закрываем соединение с PostgreSQL
+    await db.close()
 
     logger.info("👋 Бот остановлен")
 

@@ -1,219 +1,179 @@
-import sqlite3
+import asyncpg
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set, Any
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
+import os
+from dotenv import load_dotenv
 
 logger = logging.getLogger("database")
 
-# Путь к базе данных
-DB_PATH = Path("data") / "vk_data.db"
+# Загрузка конфигурации
+load_dotenv()
+
+# PostgreSQL конфигурация
+DB_CONFIG = {
+    "host": os.getenv("POSTGRES_HOST", "localhost"),
+    "port": int(os.getenv("POSTGRES_PORT", 5432)),
+    "database": os.getenv("POSTGRES_DB", "vk_data"),
+    "user": os.getenv("POSTGRES_USER", "postgres"),
+    "password": os.getenv("POSTGRES_PASSWORD", ""),
+}
 
 
 class VKDatabase:
-    """Класс для работы с базой данных результатов VK"""
+    """Класс для работы с PostgreSQL базой данных результатов VK"""
 
     def __init__(self):
-        # Убедимся, что папка data существует
-        DB_PATH.parent.mkdir(exist_ok=True)
-        self.db_path = DB_PATH
-        self._init_db()
+        self._pool = None
+        self._initialized = False
 
-    @contextmanager
-    def get_connection(self):
-        """Контекстный менеджер для безопасной работы с БД"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+    async def init(self):
+        """Инициализация пула соединений и структуры БД"""
+        if self._initialized:
+            return
+
         try:
-            yield conn
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Ошибка БД: {e}")
-            raise
-        finally:
-            conn.close()
+            # Создаем пул соединений с меньшим количеством подключений
+            self._pool = await asyncpg.create_pool(
+                **DB_CONFIG,
+                min_size=2,
+                max_size=10,
+                command_timeout=60
+            )
 
-    def _init_db(self):
+            # Инициализируем структуру БД
+            await self._init_db()
+            self._initialized = True
+            logger.info("✅ PostgreSQL база данных инициализирована")
+        except asyncpg.exceptions.TooManyConnectionsError:
+            logger.error("❌ Превышен лимит подключений к PostgreSQL")
+            logger.error("Проверьте настройки max_connections в postgresql.conf")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации БД: {e}")
+            if self._pool:
+                await self._pool.close()
+            raise
+
+    async def close(self):
+        """Закрытие пула соединений"""
+        if self._pool:
+            await self._pool.close()
+            self._initialized = False
+
+    @asynccontextmanager
+    async def acquire(self):
+        """Получение соединения из пула"""
+        if not self._initialized:
+            raise RuntimeError("Database not initialized. Call init() first.")
+        async with self._pool.acquire() as connection:
+            yield connection
+
+    async def _init_db(self):
         """Инициализация структуры базы данных"""
-        with self.get_connection() as conn:
+        # Используем прямое подключение из пула, а не acquire()
+        async with self._pool.acquire() as conn:
             # Таблица результатов VK
-            conn.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS vk_results (
                     link TEXT PRIMARY KEY,
-                    phones TEXT,  -- JSON массив телефонов
-                    full_name TEXT,
-                    birth_date TEXT,
-                    checked_at TIMESTAMP,
-                    checked_by_user_id INTEGER,
-                    found_data BOOLEAN DEFAULT 0,
-                    source TEXT DEFAULT 'search'  -- 'search' или 'import'
+                    phones JSONB DEFAULT '[]'::jsonb,
+                    full_name TEXT DEFAULT '',
+                    birth_date TEXT DEFAULT '',
+                    checked_at TIMESTAMP DEFAULT NOW(),
+                    checked_by_user_id BIGINT,
+                    found_data BOOLEAN DEFAULT FALSE,
+                    source TEXT DEFAULT 'search',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
 
-            # Миграция: добавляем колонку source если её нет
-            cursor = conn.execute("PRAGMA table_info(vk_results)")
-            columns = [column[1] for column in cursor.fetchall()]
-            if 'source' not in columns:
-                logger.info("🔄 Миграция БД: добавление колонки source")
-                conn.execute("ALTER TABLE vk_results ADD COLUMN source TEXT DEFAULT 'search'")
-
-            # Таблица пользователей и их согласий
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    accepted_disclaimer BOOLEAN DEFAULT 0,
-                    accepted_at TIMESTAMP,
-                    first_seen TIMESTAMP,
-                    last_activity TIMESTAMP
-                )
-            """)
-
-            # Таблица логов действий (для мониторинга)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS action_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    action TEXT,
-                    details TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Индексы для оптимизации
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_id 
+            # Индексы для vk_results
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_vk_user_id 
                 ON vk_results(checked_by_user_id)
             """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_checked_at 
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_vk_checked_at 
                 ON vk_results(checked_at)
             """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_found_data 
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_vk_found_data 
                 ON vk_results(found_data)
             """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_user_activity 
-                ON users(last_activity)
-            """)
-
-            # Создаем таблицу для телефонов (для быстрого поиска дубликатов)
-            conn.execute("""
+            # Таблица для связи телефонов и ссылок
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS phone_links (
                     phone TEXT,
-                    link TEXT,
-                    PRIMARY KEY (phone, link),
-                    FOREIGN KEY (link) REFERENCES vk_results(link)
+                    link TEXT REFERENCES vk_results(link) ON DELETE CASCADE,
+                    PRIMARY KEY (phone, link)
                 )
             """)
 
             # Индекс для быстрого поиска по телефону
-            conn.execute("""
+            await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_phone 
                 ON phone_links(phone)
             """)
 
-            logger.info("✅ База данных инициализирована")
+            # Таблица пользователей
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    accepted_disclaimer BOOLEAN DEFAULT FALSE,
+                    accepted_at TIMESTAMP,
+                    first_seen TIMESTAMP DEFAULT NOW(),
+                    last_activity TIMESTAMP DEFAULT NOW()
+                )
+            """)
 
-    def migrate_database(self):
-        """Выполняет миграции базы данных для обновления схемы"""
-        with self.get_connection() as conn:
-            # Получаем текущую схему таблицы vk_results
-            cursor = conn.execute("PRAGMA table_info(vk_results)")
-            columns = [column[1] for column in cursor.fetchall()]
+            # Таблица логов действий
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS action_logs (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    action TEXT,
+                    details TEXT,
+                    timestamp TIMESTAMP DEFAULT NOW()
+                )
+            """)
 
-            migrations_applied = []
+            # Индекс для логов
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_logs_user_id 
+                ON action_logs(user_id)
+            """)
 
-            # Миграция 1: Добавление колонки source
-            if 'source' not in columns:
-                logger.info("🔄 Применение миграции: добавление колонки source")
-                conn.execute("ALTER TABLE vk_results ADD COLUMN source TEXT DEFAULT 'search'")
-                migrations_applied.append("source")
+            # Создаем функцию для автоматического обновления updated_at
+            await conn.execute("""
+                CREATE OR REPLACE FUNCTION update_updated_at_column()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.updated_at = NOW();
+                    RETURN NEW;
+                END;
+                $$ language 'plpgsql';
+            """)
 
-            # Миграция 2: Создание таблицы phone_links
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-            if not cursor.fetchone():
-                logger.info("🔄 Создание таблицы phone_links для дубликатов телефонов")
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS phone_links (
-                        phone TEXT,
-                        link TEXT,
-                        PRIMARY KEY (phone, link),
-                        FOREIGN KEY (link) REFERENCES vk_results(link)
-                    )
-                """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_phone 
-                    ON phone_links(phone)
-                """)
-                migrations_applied.append("phone_links")
+            # Создаем триггер для vk_results
+            await conn.execute("""
+                DROP TRIGGER IF EXISTS update_vk_results_updated_at ON vk_results;
+                CREATE TRIGGER update_vk_results_updated_at 
+                BEFORE UPDATE ON vk_results 
+                FOR EACH ROW 
+                EXECUTE FUNCTION update_updated_at_column();
+            """)
 
-                # Заполняем таблицу существующими данными
-                logger.info("🔄 Индексация существующих телефонов...")
-                cursor = conn.execute("SELECT link, phones FROM vk_results WHERE phones IS NOT NULL AND phones != '[]'")
-                for row in cursor:
-                    try:
-                        phones = json.loads(row['phones'])
-                        for phone in phones:
-                            conn.execute("INSERT OR IGNORE INTO phone_links (phone, link) VALUES (?, ?)",
-                                         (phone, row['link']))
-                    except:
-                        pass
-
-            if migrations_applied:
-                logger.info(f"✅ Применено миграций: {len(migrations_applied)} - {', '.join(migrations_applied)}")
-            else:
-                logger.info("✅ База данных актуальна, миграции не требуются")
-
-    def check_phone_duplicates(self, phones: List[str]) -> Dict[str, List[Dict[str, str]]]:
-        """
-        Проверяет телефоны на наличие в базе
-
-        Returns:
-            Dict: {phone: [{"link": "...", "full_name": "...", "birth_date": "..."}, ...]}
-        """
-        if not phones:
-            return {}
-
-        results = {}
-        with self.get_connection() as conn:
-            # Проверяем наличие таблицы phone_links
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-            if not cursor.fetchone():
-                logger.warning("Таблица phone_links не существует, пропускаем проверку дубликатов телефонов")
-                return {}
-
-            for phone in phones:
-                cursor = conn.execute("""
-                    SELECT DISTINCT pl.link, vr.full_name, vr.birth_date
-                    FROM phone_links pl
-                    JOIN vk_results vr ON pl.link = vr.link
-                    WHERE pl.phone = ?
-                """, (phone,))
-
-                phone_results = []
-                for row in cursor:
-                    phone_results.append({
-                        "link": row["link"],
-                        "full_name": row["full_name"] or "",
-                        "birth_date": row["birth_date"] or ""
-                    })
-
-                if phone_results:
-                    results[phone] = phone_results
-
-        return results
-
-    def check_duplicates_extended(self, links: List[str]) -> Dict[str, Any]:
+    async def check_duplicates_extended(self, links: List[str]) -> Dict[str, Any]:
         """
         Проверяет список ссылок на наличие в базе
 
@@ -235,23 +195,22 @@ class VKDatabase:
         if not links:
             return result
 
-        with self.get_connection() as conn:
+        async with self.acquire() as conn:
             # Получаем все существующие ссылки одним запросом
-            placeholders = ','.join('?' * len(links))
-            query = f"""
+            rows = await conn.fetch("""
                 SELECT link, phones, full_name, birth_date, found_data 
                 FROM vk_results 
-                WHERE link IN ({placeholders})
-            """
+                WHERE link = ANY($1::text[])
+            """, links)
 
             existing_links = {}
-            for row in conn.execute(query, links):
+            for row in rows:
                 link_data = {
                     "link": row["link"],
-                    "phones": json.loads(row["phones"]) if row["phones"] else [],
+                    "phones": row["phones"] or [],
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or "",
-                    "found_data": bool(row["found_data"])
+                    "found_data": row["found_data"]
                 }
                 existing_links[row["link"]] = link_data
 
@@ -268,7 +227,7 @@ class VKDatabase:
 
         return result
 
-    def check_phone_duplicates(self, phones: List[str]) -> Dict[str, List[Dict[str, str]]]:
+    async def check_phone_duplicates(self, phones: List[str]) -> Dict[str, List[Dict[str, str]]]:
         """
         Проверяет телефоны на наличие в базе
 
@@ -279,29 +238,66 @@ class VKDatabase:
             return {}
 
         results = {}
-        with self.get_connection() as conn:
-            for phone in phones:
-                cursor = conn.execute("""
-                    SELECT DISTINCT pl.link, vr.full_name, vr.birth_date
-                    FROM phone_links pl
-                    JOIN vk_results vr ON pl.link = vr.link
-                    WHERE pl.phone = ?
-                """, (phone,))
+        async with self.acquire() as conn:
+            # Получаем все связи телефонов одним запросом
+            rows = await conn.fetch("""
+                SELECT DISTINCT pl.phone, pl.link, vr.full_name, vr.birth_date
+                FROM phone_links pl
+                JOIN vk_results vr ON pl.link = vr.link
+                WHERE pl.phone = ANY($1::text[])
+                ORDER BY pl.phone, pl.link
+            """, phones)
 
-                phone_results = []
-                for row in cursor:
-                    phone_results.append({
-                        "link": row["link"],
-                        "full_name": row["full_name"] or "",
-                        "birth_date": row["birth_date"] or ""
-                    })
+            # Группируем по телефонам
+            for row in rows:
+                phone = row["phone"]
+                if phone not in results:
+                    results[phone] = []
 
-                if phone_results:
-                    results[phone] = phone_results
+                results[phone].append({
+                    "link": row["link"],
+                    "full_name": row["full_name"] or "",
+                    "birth_date": row["birth_date"] or ""
+                })
 
         return results
 
-    def find_links_by_phone(self, phone: str) -> List[Dict[str, Any]]:
+    async def check_both_duplicates(self, links: List[str], phones: List[str]) -> Dict[str, Any]:
+        """
+        Проверяет и ссылки и телефоны на дубликаты одновременно
+
+        Returns:
+            {
+                "duplicate_links": Set[str],  # Ссылки, которые уже есть в БД
+                "duplicate_phones": Set[str],  # Телефоны, которые уже есть в БД
+                "all_duplicates": bool  # True если есть хоть один дубликат
+            }
+        """
+        duplicate_links = set()
+        duplicate_phones = set()
+
+        async with self.acquire() as conn:
+            # Проверяем ссылки
+            if links:
+                link_rows = await conn.fetch("""
+                    SELECT link FROM vk_results WHERE link = ANY($1::text[])
+                """, links)
+                duplicate_links = {row["link"] for row in link_rows}
+
+            # Проверяем телефоны
+            if phones:
+                phone_rows = await conn.fetch("""
+                    SELECT DISTINCT phone FROM phone_links WHERE phone = ANY($1::text[])
+                """, phones)
+                duplicate_phones = {row["phone"] for row in phone_rows}
+
+        return {
+            "duplicate_links": duplicate_links,
+            "duplicate_phones": duplicate_phones,
+            "all_duplicates": bool(duplicate_links or duplicate_phones)
+        }
+
+    async def find_links_by_phone(self, phone: str) -> List[Dict[str, Any]]:
         """
         Находит все ссылки, связанные с телефоном
 
@@ -313,25 +309,19 @@ class VKDatabase:
         """
         results = []
 
-        with self.get_connection() as conn:
-            # Проверяем наличие таблицы phone_links
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-            if not cursor.fetchone():
-                logger.warning("Таблица phone_links не существует")
-                return []
-
-            cursor = conn.execute("""
+        async with self.acquire() as conn:
+            rows = await conn.fetch("""
                 SELECT vr.link, vr.phones, vr.full_name, vr.birth_date, vr.checked_at
                 FROM phone_links pl
                 JOIN vk_results vr ON pl.link = vr.link
-                WHERE pl.phone = ?
+                WHERE pl.phone = $1
                 ORDER BY vr.checked_at DESC
-            """, (phone,))
+            """, phone)
 
-            for row in cursor:
+            for row in rows:
                 results.append({
                     "link": row["link"],
-                    "phones": json.loads(row["phones"]) if row["phones"] else [],
+                    "phones": row["phones"] or [],
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or "",
                     "checked_at": row["checked_at"]
@@ -339,163 +329,115 @@ class VKDatabase:
 
         return results
 
-    def get_phone_statistics(self) -> Dict[str, Any]:
-        """Получает статистику по телефонам в базе"""
-        with self.get_connection() as conn:
-            # Проверяем наличие таблицы phone_links
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-            if not cursor.fetchone():
-                return {
-                    "total_unique_phones": 0,
-                    "phones_with_multiple_links": 0,
-                    "top_phones": []
-                }
-
-            # Общее количество уникальных телефонов
-            total_phones = conn.execute("SELECT COUNT(DISTINCT phone) FROM phone_links").fetchone()[0]
-
-            # Телефоны с несколькими ссылками
-            duplicate_phones = conn.execute("""
-                SELECT COUNT(DISTINCT phone) 
-                FROM (
-                    SELECT phone, COUNT(link) as cnt 
-                    FROM phone_links 
-                    GROUP BY phone 
-                    HAVING cnt > 1
-                )
-            """).fetchone()[0]
-
-            # Топ телефонов по количеству ссылок
-            top_phones = conn.execute("""
-                SELECT phone, COUNT(link) as link_count
-                FROM phone_links
-                GROUP BY phone
-                ORDER BY link_count DESC
-                LIMIT 10
-            """).fetchall()
-
-            return {
-                "total_unique_phones": total_phones,
-                "phones_with_multiple_links": duplicate_phones,
-                "top_phones": [(row[0], row[1]) for row in top_phones]
-            }
-
-    def save_result(self, link: str, result_data: Dict[str, Any], user_id: int, source: str = "search"):
+    async def save_result(self, link: str, result_data: Dict[str, Any], user_id: int, source: str = "search"):
         """Сохраняет результат проверки ссылки"""
-        phones_json = json.dumps(result_data.get("phones", []))
+        phones = result_data.get("phones", [])
         full_name = result_data.get("full_name", "")
         birth_date = result_data.get("birth_date", "")
-        found_data = bool(result_data.get("phones") or full_name or birth_date)
+        found_data = bool(phones or full_name or birth_date)
 
         try:
-            with self.get_connection() as conn:
-                # Проверяем наличие колонки source
-                cursor = conn.execute("PRAGMA table_info(vk_results)")
-                columns = [column[1] for column in cursor.fetchall()]
-
-                if 'source' in columns:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO vk_results 
+            async with self.acquire() as conn:
+                # Используем транзакцию
+                async with conn.transaction():
+                    # Сохраняем или обновляем результат
+                    await conn.execute("""
+                        INSERT INTO vk_results 
                         (link, phones, full_name, birth_date, checked_at, checked_by_user_id, found_data, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (link, phones_json, full_name, birth_date, datetime.now(), user_id, found_data, source))
-                else:
-                    # Fallback для старой схемы БД
-                    conn.execute("""
-                        INSERT OR REPLACE INTO vk_results 
-                        (link, phones, full_name, birth_date, checked_at, checked_by_user_id, found_data)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (link, phones_json, full_name, birth_date, datetime.now(), user_id, found_data))
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        ON CONFLICT (link) DO UPDATE SET
+                            phones = EXCLUDED.phones,
+                            full_name = EXCLUDED.full_name,
+                            birth_date = EXCLUDED.birth_date,
+                            checked_at = EXCLUDED.checked_at,
+                            checked_by_user_id = EXCLUDED.checked_by_user_id,
+                            found_data = EXCLUDED.found_data,
+                            source = EXCLUDED.source
+                    """, link, json.dumps(phones), full_name, birth_date,
+                                       datetime.now(), user_id, found_data, source)
 
-                # Сохраняем телефоны в таблицу phone_links
-                phones = result_data.get("phones", [])
-                if phones:
-                    # Проверяем наличие таблицы phone_links
-                    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-                    if cursor.fetchone():
-                        # Удаляем старые записи для этой ссылки
-                        conn.execute("DELETE FROM phone_links WHERE link = ?", (link,))
-                        # Добавляем новые
-                        for phone in phones:
-                            conn.execute("INSERT OR IGNORE INTO phone_links (phone, link) VALUES (?, ?)",
-                                         (phone, link))
+                    # Удаляем старые записи телефонов для этой ссылки
+                    await conn.execute("DELETE FROM phone_links WHERE link = $1", link)
+
+                    # Добавляем новые телефоны
+                    if phones:
+                        phone_data = [(phone, link) for phone in phones]
+                        await conn.executemany(
+                            "INSERT INTO phone_links (phone, link) VALUES ($1, $2)",
+                            phone_data
+                        )
 
                 # Логируем действие
-                self.log_action(user_id, "save_result", f"link: {link}, found: {found_data}")
+                await self.log_action(user_id, "save_result", f"link: {link}, found: {found_data}")
 
                 logger.info(f"💾 Сохранен результат для {link}")
         except Exception as e:
             logger.error(f"❌ Ошибка при сохранении результата для {link}: {e}")
 
-    def get_cached_results(self, links: List[str]) -> Dict[str, Dict]:
+    async def get_cached_results(self, links: List[str]) -> Dict[str, Dict]:
         """Получает закешированные результаты для списка ссылок"""
         results = {}
 
         if not links:
             return results
 
-        with self.get_connection() as conn:
-            placeholders = ','.join('?' * len(links))
-            query = f"""
+        async with self.acquire() as conn:
+            rows = await conn.fetch("""
                 SELECT link, phones, full_name, birth_date 
                 FROM vk_results 
-                WHERE link IN ({placeholders}) AND found_data = 1
-            """
+                WHERE link = ANY($1::text[]) AND found_data = TRUE
+            """, links)
 
-            for row in conn.execute(query, links):
+            for row in rows:
                 results[row["link"]] = {
-                    "phones": json.loads(row["phones"]) if row["phones"] else [],
+                    "phones": row["phones"] or [],
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or ""
                 }
 
         return results
 
-    def get_user_statistics(self, user_id: int) -> Dict[str, int]:
+    async def get_user_statistics(self, user_id: int) -> Dict[str, int]:
         """Получает статистику пользователя"""
-        with self.get_connection() as conn:
-            stats = conn.execute("""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow("""
                 SELECT 
                     COUNT(*) as total_checked,
-                    SUM(CASE WHEN found_data = 1 THEN 1 ELSE 0 END) as found_data_count,
+                    COUNT(*) FILTER (WHERE found_data = TRUE) as found_data_count,
                     COUNT(DISTINCT DATE(checked_at)) as days_active
                 FROM vk_results 
-                WHERE checked_by_user_id = ?
-            """, (user_id,)).fetchone()
+                WHERE checked_by_user_id = $1
+            """, user_id)
 
             return {
-                "total_checked": stats["total_checked"] or 0,
-                "found_data_count": stats["found_data_count"] or 0,
-                "days_active": stats["days_active"] or 0
+                "total_checked": row["total_checked"] or 0,
+                "found_data_count": row["found_data_count"] or 0,
+                "days_active": row["days_active"] or 0
             }
 
-    def get_database_statistics(self) -> Dict[str, int]:
+    async def get_database_statistics(self) -> Dict[str, int]:
         """Получает общую статистику базы данных"""
-        with self.get_connection() as conn:
-            stats = conn.execute("""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow("""
                 SELECT 
                     COUNT(*) as total_records,
-                    SUM(CASE WHEN found_data = 1 THEN 1 ELSE 0 END) as with_data,
-                    SUM(CASE WHEN found_data = 0 THEN 1 ELSE 0 END) as without_data
+                    COUNT(*) FILTER (WHERE found_data = TRUE) as with_data,
+                    COUNT(*) FILTER (WHERE found_data = FALSE) as without_data
                 FROM vk_results
-            """).fetchone()
+            """)
 
             return {
-                "total_records": stats["total_records"] or 0,
-                "with_data": stats["with_data"] or 0,
-                "without_data": stats["without_data"] or 0
+                "total_records": row["total_records"] or 0,
+                "with_data": row["with_data"] or 0,
+                "without_data": row["without_data"] or 0
             }
 
-    def batch_save_results(self, results: List[Dict[str, Any]], user_id: int, source: str = "import") -> Dict[str, int]:
+    async def batch_save_results(self, results: List[Dict[str, Any]], user_id: int, source: str = "import") -> Dict[
+        str, int]:
         """Массовое сохранение результатов (для импорта БД)"""
         stats = {"added": 0, "updated": 0, "errors": 0}
 
-        with self.get_connection() as conn:
-            # Проверяем наличие колонки source
-            cursor = conn.execute("PRAGMA table_info(vk_results)")
-            columns = [column[1] for column in cursor.fetchall()]
-            has_source_column = 'source' in columns
-
+        async with self.acquire() as conn:
             for result in results:
                 try:
                     link = result.get("link", "")
@@ -504,175 +446,161 @@ class VKDatabase:
                         continue
 
                     # Проверяем, существует ли запись
-                    existing = conn.execute(
-                        "SELECT 1 FROM vk_results WHERE link = ?", (link,)
-                    ).fetchone()
+                    existing = await conn.fetchval(
+                        "SELECT 1 FROM vk_results WHERE link = $1", link
+                    )
 
-                    phones_json = json.dumps(result.get("phones", []))
+                    phones = result.get("phones", [])
                     full_name = result.get("full_name", "")
                     birth_date = result.get("birth_date", "")
-                    found_data = bool(result.get("phones") or full_name or birth_date)
+                    found_data = bool(phones or full_name or birth_date)
 
-                    if has_source_column:
-                        conn.execute("""
-                            INSERT OR REPLACE INTO vk_results 
+                    async with conn.transaction():
+                        # Сохраняем результат
+                        await conn.execute("""
+                            INSERT INTO vk_results 
                             (link, phones, full_name, birth_date, checked_at, checked_by_user_id, found_data, source)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (link, phones_json, full_name, birth_date, datetime.now(), user_id, found_data, source))
-                    else:
-                        # Fallback для старой схемы БД
-                        conn.execute("""
-                            INSERT OR REPLACE INTO vk_results 
-                            (link, phones, full_name, birth_date, checked_at, checked_by_user_id, found_data)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (link, phones_json, full_name, birth_date, datetime.now(), user_id, found_data))
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            ON CONFLICT (link) DO UPDATE SET
+                                phones = EXCLUDED.phones,
+                                full_name = EXCLUDED.full_name,
+                                birth_date = EXCLUDED.birth_date,
+                                checked_at = EXCLUDED.checked_at,
+                                checked_by_user_id = EXCLUDED.checked_by_user_id,
+                                found_data = EXCLUDED.found_data,
+                                source = EXCLUDED.source
+                        """, link, json.dumps(phones), full_name, birth_date,
+                                           datetime.now(), user_id, found_data, source)
+
+                        # Обновляем телефоны
+                        await conn.execute("DELETE FROM phone_links WHERE link = $1", link)
+
+                        if phones:
+                            phone_data = [(phone, link) for phone in phones]
+                            await conn.executemany(
+                                "INSERT INTO phone_links (phone, link) VALUES ($1, $2)",
+                                phone_data
+                            )
 
                     if existing:
                         stats["updated"] += 1
                     else:
                         stats["added"] += 1
 
-                    # Сохраняем телефоны в таблицу phone_links
-                    phones = result.get("phones", [])
-                    if phones and has_source_column:
-                        # Проверяем наличие таблицы phone_links
-                        cursor = conn.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name='phone_links'")
-                        if cursor.fetchone():
-                            # Удаляем старые записи для этой ссылки
-                            conn.execute("DELETE FROM phone_links WHERE link = ?", (link,))
-                            # Добавляем новые
-                            for phone in phones:
-                                conn.execute("INSERT OR IGNORE INTO phone_links (phone, link) VALUES (?, ?)",
-                                             (phone, link))
-
                 except Exception as e:
                     logger.error(f"Ошибка при сохранении {result.get('link', 'unknown')}: {e}")
                     stats["errors"] += 1
 
         # Логируем массовое действие
-        self.log_action(user_id, "batch_import", json.dumps(stats))
+        await self.log_action(user_id, "batch_import", json.dumps(stats))
 
         return stats
 
-    def check_user_accepted_disclaimer(self, user_id: int) -> bool:
+    async def check_user_accepted_disclaimer(self, user_id: int) -> bool:
         """Проверка, принял ли пользователь условия использования"""
-        with self.get_connection() as conn:
-            user = conn.execute(
-                "SELECT accepted_disclaimer FROM users WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()
+        async with self.acquire() as conn:
+            accepted = await conn.fetchval(
+                "SELECT accepted_disclaimer FROM users WHERE user_id = $1",
+                user_id
+            )
+            return bool(accepted)
 
-            return bool(user and user["accepted_disclaimer"])
-
-    def set_user_accepted_disclaimer(self, user_id: int, user_data: Optional[Dict] = None):
+    async def set_user_accepted_disclaimer(self, user_id: int, user_data: Optional[Dict] = None):
         """Отметка о принятии условий использования"""
-        with self.get_connection() as conn:
-            username = user_data.get("username", "") if user_data else ""
-            first_name = user_data.get("first_name", "") if user_data else ""
-            last_name = user_data.get("last_name", "") if user_data else ""
+        username = user_data.get("username", "") if user_data else ""
+        first_name = user_data.get("first_name", "") if user_data else ""
+        last_name = user_data.get("last_name", "") if user_data else ""
 
-            conn.execute("""
-                INSERT OR REPLACE INTO users 
-                (user_id, username, first_name, last_name, accepted_disclaimer, accepted_at, first_seen, last_activity)
-                VALUES (?, ?, ?, ?, 1, ?, 
-                    COALESCE((SELECT first_seen FROM users WHERE user_id = ?), ?),
-                    ?)
-            """, (user_id, username, first_name, last_name, datetime.now(), user_id, datetime.now(), datetime.now()))
+        async with self.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users 
+                (user_id, username, first_name, last_name, accepted_disclaimer, accepted_at)
+                VALUES ($1, $2, $3, $4, TRUE, $5)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    accepted_disclaimer = TRUE,
+                    accepted_at = EXCLUDED.accepted_at,
+                    last_activity = NOW()
+            """, user_id, username, first_name, last_name, datetime.now())
 
-            self.log_action(user_id, "accept_disclaimer", "")
+            await self.log_action(user_id, "accept_disclaimer", "")
 
-    def update_user_activity(self, user_id: int):
+    async def update_user_activity(self, user_id: int):
         """Обновление времени последней активности пользователя"""
-        with self.get_connection() as conn:
-            conn.execute(
-                "UPDATE users SET last_activity = ? WHERE user_id = ?",
-                (datetime.now(), user_id)
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_activity = $1 WHERE user_id = $2",
+                datetime.now(), user_id
             )
 
-    def log_action(self, user_id: int, action: str, details: str = ""):
+    async def log_action(self, user_id: int, action: str, details: str = ""):
         """Логирование действий пользователя"""
         try:
-            with self.get_connection() as conn:
-                conn.execute("""
+            async with self.acquire() as conn:
+                await conn.execute("""
                     INSERT INTO action_logs (user_id, action, details)
-                    VALUES (?, ?, ?)
-                """, (user_id, action, details[:1000]))  # Ограничиваем длину деталей
+                    VALUES ($1, $2, $3)
+                """, user_id, action, details[:1000])  # Ограничиваем длину деталей
         except Exception as e:
             logger.error(f"Ошибка логирования действия: {e}")
 
-    def get_recent_actions(self, user_id: Optional[int] = None, limit: int = 100) -> List[Dict]:
-        """Получение последних действий (для мониторинга)"""
-        with self.get_connection() as conn:
-            if user_id:
-                query = """
-                    SELECT * FROM action_logs 
-                    WHERE user_id = ? 
-                    ORDER BY timestamp DESC 
-                    LIMIT ?
-                """
-                cursor = conn.execute(query, (user_id, limit))
-            else:
-                query = """
-                    SELECT * FROM action_logs 
-                    ORDER BY timestamp DESC 
-                    LIMIT ?
-                """
-                cursor = conn.execute(query, (limit,))
+    async def get_phone_statistics(self) -> Dict[str, Any]:
+        """Получает статистику по телефонам в базе"""
+        async with self.acquire() as conn:
+            # Общее количество уникальных телефонов
+            total_phones = await conn.fetchval(
+                "SELECT COUNT(DISTINCT phone) FROM phone_links"
+            ) or 0
 
-            return [dict(row) for row in cursor]
+            # Телефоны с несколькими ссылками
+            duplicate_phones = await conn.fetchval("""
+                SELECT COUNT(DISTINCT phone) 
+                FROM (
+                    SELECT phone, COUNT(link) as cnt 
+                    FROM phone_links 
+                    GROUP BY phone 
+                    HAVING COUNT(link) > 1
+                ) t
+            """) or 0
 
-    def clear_old_records(self, days: int = 30):
-        """Удаляет старые записи (опционально)"""
-        with self.get_connection() as conn:
-            # Сначала удаляем связанные записи из phone_links
-            conn.execute("""
-                DELETE FROM phone_links 
-                WHERE link IN (
-                    SELECT link FROM vk_results 
-                    WHERE checked_at < datetime('now', '-{} days')
-                    AND found_data = 0
-                )
-            """.format(days))
+            # Топ телефонов по количеству ссылок
+            top_phones_rows = await conn.fetch("""
+                SELECT phone, COUNT(link) as link_count
+                FROM phone_links
+                GROUP BY phone
+                ORDER BY link_count DESC
+                LIMIT 10
+            """)
 
-            # Удаляем старые результаты без данных
-            conn.execute("""
-                DELETE FROM vk_results 
-                WHERE checked_at < datetime('now', '-{} days')
-                AND found_data = 0
-            """.format(days))
+            return {
+                "total_unique_phones": total_phones,
+                "phones_with_multiple_links": duplicate_phones,
+                "top_phones": [(row["phone"], row["link_count"]) for row in top_phones_rows]
+            }
 
-            # Удаляем старые логи
-            conn.execute("""
-                DELETE FROM action_logs 
-                WHERE timestamp < datetime('now', '-{} days')
-            """.format(days * 2))  # Логи храним дольше
-
-            logger.info(f"🗑️ Удалены старые записи")
-
-    def export_to_dict(self, user_id: Optional[int] = None) -> List[Dict]:
+    async def export_to_dict(self, user_id: Optional[int] = None) -> List[Dict]:
         """Экспорт данных в формате словаря (для бэкапов)"""
-        with self.get_connection() as conn:
+        async with self.acquire() as conn:
             if user_id:
-                query = """
+                rows = await conn.fetch("""
                     SELECT link, phones, full_name, birth_date
                     FROM vk_results
-                    WHERE checked_by_user_id = ? AND found_data = 1
-                """
-                cursor = conn.execute(query, (user_id,))
+                    WHERE checked_by_user_id = $1 AND found_data = TRUE
+                """, user_id)
             else:
-                query = """
+                rows = await conn.fetch("""
                     SELECT link, phones, full_name, birth_date
                     FROM vk_results
-                    WHERE found_data = 1
-                """
-                cursor = conn.execute(query)
+                    WHERE found_data = TRUE
+                """)
 
             results = []
-            for row in cursor:
+            for row in rows:
                 results.append({
                     "link": row["link"],
-                    "phones": json.loads(row["phones"]) if row["phones"] else [],
+                    "phones": row["phones"] or [],
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or ""
                 })
