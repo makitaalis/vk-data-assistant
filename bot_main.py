@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import tempfile
+import time
 from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 
@@ -20,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from aiogram.types.bot_command import BotCommand
 
-from vk_worker import VKWorker, init_project_structure
+from vk_worker import MultiVKWorker, init_project_structure
 from database import VKDatabase
 from excel_processor import ExcelProcessor
 from db_loader import DatabaseLoader
@@ -150,6 +151,8 @@ MESSAGES = {
 🔍 Новых проверок: {new_checks}
 ❌ Без результата: {not_found}
 
+💡 <i>Данные из кеша используются автоматически для ускорения</i>
+
 <i>Обновлено: {time}</i>
 """,
 
@@ -176,13 +179,13 @@ MESSAGES = {
 """,
 
     "file_ready": """
-📦 <b>Файл с результатами</b>
+📦 <b>Файл с результатами готов!</b>
 
-📋 Обработано ссылок: {total}
-✅ С данными: {found}
+📋 Всего обработано ссылок: {total}
+✅ Найдено данных: {found}
 ❌ Без данных: {not_found}
 
-<i>Файл содержит все найденные данные в удобном формате</i>
+<i>Файл содержит все результаты в формате Excel</i>
 """,
 
     "duplicate_analysis": """
@@ -550,6 +553,14 @@ async def set_user_accepted_disclaimer(user_id: int):
 
 # ───────────────────────────  Хелперы  ────────────────────────────────────
 
+async def notify_admins(message: str):
+    """Отправка уведомлений администраторам"""
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"🚨 <b>Системное уведомление</b>\n\n{message}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
 
 def create_progress_bar(current: int, total: int, length: int = 10) -> str:
     """Создает визуальный прогресс-бар"""
@@ -583,8 +594,9 @@ async def analyze_file_inline(file_path: pathlib.Path) -> Dict[str, Any]:
         all_phones.update(r.get('phones', []))
 
     # Проверка дубликатов
-    duplicate_vk = await db.check_duplicates_extended(all_vk_links) if all_vk_links else {"new": [], "duplicates_with_data": {},
-                                                                           "duplicates_no_data": []}
+    duplicate_vk = await db.check_duplicates_extended(all_vk_links) if all_vk_links else {"new": [],
+                                                                                          "duplicates_with_data": {},
+                                                                                          "duplicates_no_data": []}
     duplicate_phones = await db.check_phone_duplicates(list(all_phones)) if all_phones else {}
 
     # Генерация рекомендаций
@@ -826,41 +838,39 @@ async def create_excel_from_results(all_results: Dict[str, Dict[str, Any]], link
     files_to_return = []
 
     try:
-        rows = []
+        # Подготавливаем данные для DataFrame
+        data_for_df = []
 
         for link in links_order:
-            data = all_results.get(link, {})
+            result_data = all_results.get(link, {})
 
-            # Создаем строку с правильным порядком полей
-            row = OrderedDict()
-            row["link"] = link
+            # Извлекаем данные
+            phones = result_data.get("phones", [])
+            full_name = result_data.get("full_name", "")
+            birth_date = result_data.get("birth_date", "")
 
-            # Добавляем телефоны
-            phones = data.get("phones", [])
-            for i in range(4):
-                if i < len(phones):
-                    row[f"phone_{i + 1}"] = phones[i]
-                else:
-                    row[f"phone_{i + 1}"] = ""
+            # Создаем словарь для строки
+            row_data = {
+                "Ссылка VK": link,
+                "Телефон 1": phones[0] if len(phones) > 0 else "",
+                "Телефон 2": phones[1] if len(phones) > 1 else "",
+                "Телефон 3": phones[2] if len(phones) > 2 else "",
+                "Телефон 4": phones[3] if len(phones) > 3 else "",
+                "Полное имя": full_name,
+                "Дата рождения": birth_date
+            }
 
-            # Добавляем имя и дату рождения
-            row["full_name"] = data.get("full_name", "")
-            row["birth_date"] = data.get("birth_date", "")
+            data_for_df.append(row_data)
 
-            rows.append(row)
+        # Создаем DataFrame из списка словарей
+        df = pd.DataFrame(data_for_df)
 
-        # Создаем DataFrame с явным указанием столбцов
-        columns = ["link", "phone_1", "phone_2", "phone_3", "phone_4", "full_name", "birth_date"]
-
-        # Создаем пустой DataFrame с нужными столбцами
-        df = pd.DataFrame(columns=columns)
-
-        # Добавляем строки
-        for row in rows:
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-
-        # Переименовываем столбцы на русские названия
-        df.columns = ["Ссылка VK", "Телефон 1", "Телефон 2", "Телефон 3", "Телефон 4", "Полное имя", "Дата рождения"]
+        # Если DataFrame пустой, создаем с правильными колонками
+        if len(df) == 0:
+            df = pd.DataFrame(columns=[
+                "Ссылка VK", "Телефон 1", "Телефон 2", "Телефон 3",
+                "Телефон 4", "Полное имя", "Дата рождения"
+            ])
 
         # Сохраняем в Excel
         with pd.ExcelWriter(path_result, engine='openpyxl') as writer:
@@ -881,10 +891,23 @@ async def create_excel_from_results(all_results: Dict[str, Dict[str, Any]], link
                 if adjusted_width > 0:
                     worksheet.column_dimensions[column_cells[0].column_letter].width = adjusted_width
 
-        logger.info(f"Сохранен файл с данными: {path_result}")
+        logger.info(f"✅ Сохранен файл с данными: {path_result}")
 
-        found_count = sum(1 for link in links_order if all_results.get(link, {}).get("phones"))
-        not_found_count = len(links_order) - found_count
+        # Правильный подсчет статистики
+        found_count = 0
+        not_found_count = 0
+
+        for link in links_order:
+            data = all_results.get(link, {})
+            # Проверяем есть ли хоть какие-то данные
+            has_phones = bool(data.get("phones", []))
+            has_name = bool(data.get("full_name", ""))
+            has_birth = bool(data.get("birth_date", ""))
+
+            if has_phones or has_name or has_birth:
+                found_count += 1
+            else:
+                not_found_count += 1
 
         caption = MESSAGES["file_ready"].format(
             total=len(links_order),
@@ -913,7 +936,23 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="findphone", description="🔍 Поиск по телефону"),
         BotCommand(command="cancel", description="🚫 Отменить обработку"),
     ]
+
+    # Добавляем команды для админов
+    admin_commands = commands + [
+        BotCommand(command="botstatus", description="🤖 Статус VK ботов"),
+        BotCommand(command="debug", description="🐛 Отладочная информация")
+    ]
+
+    # Устанавливаем команды для обычных пользователей
     await bot.set_my_commands(commands)
+
+    # Устанавливаем расширенные команды для админов
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(admin_commands, scope=types.BotCommandScopeChat(chat_id=admin_id))
+        except:
+            pass
+
     logger.info("✅ Команды бота настроены")
 
 
@@ -978,10 +1017,20 @@ async def cmd_status(msg: types.Message):
         await msg.answer(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id))
         return
 
-    total = len(session["links"])
-    processed = len(session.get("results", {}))
-    found = sum(1 for data in session.get("results", {}).values() if data.get("phones"))
-    not_found = processed - found
+    total = len(session.get("links", []))
+    results = session.get("results", {})
+    processed = len(results)
+
+    # Правильный подсчет статистики
+    found = 0
+    not_found = 0
+
+    for data in results.values():
+        if data.get("phones") or data.get("full_name") or data.get("birth_date"):
+            found += 1
+        else:
+            not_found += 1
+
     pending = total - processed
 
     progress_bar = create_progress_bar(processed, total)
@@ -1102,6 +1151,61 @@ async def cmd_find_phone(msg: types.Message):
         response += f"... и еще {len(results) - 10} профилей"
 
     await msg.answer(response, reply_markup=back_to_menu_kb(), disable_web_page_preview=True)
+
+
+@router.message(Command("botstatus"))
+async def cmd_bot_status(msg: types.Message):
+    """Проверка статуса VK ботов (только для админов)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        return
+
+    status_msg = await msg.answer("🔄 Проверяю статус ботов...")
+
+    # Создаем временного воркера для проверки
+    test_queue = asyncio.Queue()
+    await test_queue.put("https://vk.com/id1")  # Тестовая ссылка
+
+    async def test_result_cb(link: str, result: Dict):
+        pass
+
+    async def test_limit_cb():
+        pass
+
+    worker = MultiVKWorker(test_queue, test_result_cb, test_limit_cb, notify_admins)
+
+    # Только инициализация для проверки
+    from telethon import TelegramClient
+    worker.client = TelegramClient(
+        f"{os.environ.get('SESSION_NAME', 'user_session')}_test",
+        int(os.environ.get("API_ID", 0)),
+        os.environ.get("API_HASH", "")
+    )
+
+    try:
+        await worker.client.start(phone=os.environ.get("ACCOUNT_PHONE"))
+        await worker._initialize_bots()
+        await worker._check_balance()
+
+        status_text = f"""
+🤖 <b>Статус VK ботов</b>
+
+💰 <b>Баланс:</b> {worker.current_balance or 'Неизвестно'} поисков
+🔌 <b>Активных ботов:</b> {len([b for b in worker.bots if b.is_active])}/{len(worker.bots)}
+
+<b>Детали по ботам:</b>
+"""
+
+        for bot in worker.bots:
+            status_emoji = "✅" if bot.is_active else "❌"
+            status_text += f"\n{status_emoji} Бот #{bot.bot_id}: {bot.bot_username}"
+
+        await status_msg.edit_text(status_text)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка проверки: {str(e)}")
+    finally:
+        if worker.client:
+            await worker.client.disconnect()
 
 
 # ───────────────────────────  Обработчики callback  ────────────────────────────
@@ -1476,6 +1580,18 @@ async def on_process_only(call: CallbackQuery):
         )
         return
 
+    # ВАЖНО: Сохраняем информацию о файле и ссылках в сессию
+    session_data = {
+        "links": links,
+        "links_order": links,
+        "results": {},
+        "all_links": links,
+        "temp_file": session.get('temp_file'),
+        "file_name": session.get('file_name'),
+        # Не сохраняем processor!
+    }
+    await save_user_session(user_id, session_data)
+
     # Запускаем обработку
     await call.message.edit_text(f"📤 Начинаю обработку {len(links)} ссылок...")
 
@@ -1484,6 +1600,7 @@ async def on_process_only(call: CallbackQuery):
 
     # Запускаем обработку
     await start_processing(call.message, links, processor, duplicate_check, user_id)
+
 
 
 @router.callback_query(F.data == "analyze_and_process")
@@ -1524,6 +1641,14 @@ async def on_process_after_analysis(call: CallbackQuery):
     processor = ExcelProcessor()
     processor.load_excel_file(file_path)  # Загружаем для сохранения результатов
 
+    # ВАЖНО: Обновляем сессию со ссылками
+    session["links"] = vk_links
+    session["links_order"] = vk_links
+    session["results"] = {}
+    session["processor"] = processor
+    session["all_links"] = vk_links
+    await save_user_session(user_id, session)
+
     # Используем уже полученную информацию о дубликатах
     duplicate_check = analysis['duplicates']['vk']
 
@@ -1532,6 +1657,42 @@ async def on_process_after_analysis(call: CallbackQuery):
     # Запускаем обработку
     await start_processing(call.message, vk_links, processor, duplicate_check, user_id)
 
+
+@router.message(Command("debug"))
+async def cmd_debug(msg: types.Message):
+    """Команда для отладки (только для админов)"""
+    if msg.from_user.id not in ADMIN_IDS:
+        return
+
+    user_id = msg.from_user.id
+    session = await get_user_session(user_id)
+
+    if not session:
+        await msg.answer("❌ Нет активной сессии")
+        return
+
+    debug_info = f"""
+🐛 <b>Отладочная информация</b>
+
+<b>Сессия:</b>
+- Ссылок всего: {len(session.get('links', []))}
+- Результатов: {len(session.get('results', {}))}
+- Порядок ссылок: {len(session.get('links_order', []))}
+
+<b>Результаты:</b>
+"""
+
+    results = session.get('results', {})
+    for i, (link, data) in enumerate(list(results.items())[:5]):
+        debug_info += f"\n{i + 1}. {link[:30]}..."
+        debug_info += f"\n   📱 Телефоны: {len(data.get('phones', []))}"
+        debug_info += f"\n   👤 Имя: {'✓' if data.get('full_name') else '✗'}"
+        debug_info += f"\n   🎂 ДР: {'✓' if data.get('birth_date') else '✗'}"
+
+    if len(results) > 5:
+        debug_info += f"\n\n... и еще {len(results) - 5} результатов"
+
+    await msg.answer(debug_info)
 
 @router.callback_query(F.data == "analysis_details")
 async def on_analysis_details(call: CallbackQuery):
@@ -1714,10 +1875,11 @@ async def start_processing(
         processed=from_cache,
         total=total,
         percent=int((from_cache / total) * 100) if total > 0 else 0,
-        found=sum(1 for r in cached_results.values() if r.get("phones")),
+        found=sum(1 for r in cached_results.values() if r.get("phones") or r.get("full_name") or r.get("birth_date")),
         from_cache=from_cache,
         new_checks=0,
-        not_found=0,
+        not_found=sum(
+            1 for r in cached_results.values() if not (r.get("phones") or r.get("full_name") or r.get("birth_date"))),
         time=format_time()
     )
 
@@ -1725,6 +1887,15 @@ async def start_processing(
 
     # Начинаем с результатов из кеша
     all_results = dict(cached_results)
+
+    # ВАЖНО: Сохраняем результаты и порядок ссылок в сессию
+    session = {
+        "results": all_results,
+        "links": links_to_process,
+        "links_order": links_to_process,
+        # Не сохраняем processor и duplicate_check!
+    }
+    await save_user_session(user_id, session)
 
     # Если все результаты из кеша
     if not links_to_check:
@@ -1738,6 +1909,7 @@ async def start_processing(
 
     new_checks_count = 0
     last_status_text = ""
+    start_time = time.time()
 
     async def result_cb(link: str, result_data: Dict[str, Any]):
         nonlocal new_checks_count, last_status_text
@@ -1748,35 +1920,57 @@ async def start_processing(
         # Сохраняем в базу данных
         await db.save_result(link, result_data, user_id)
 
+        # ВАЖНО: Обновляем сессию с новыми результатами
+        session["results"] = all_results
+        await save_user_session(user_id, session)
+
         new_checks_count += 1
         processed = len(all_results)
 
-        found_count = sum(1 for data in all_results.values() if data.get("phones"))
-        not_found_count = processed - found_count
+        # Правильный подсчет статистики
+        found_count = 0
+        not_found_count = 0
 
-        progress_bar = create_progress_bar(processed, total)
-        percent = int((processed / total) * 100)
+        for data in all_results.values():
+            if data.get("phones") or data.get("full_name") or data.get("birth_date"):
+                found_count += 1
+            else:
+                not_found_count += 1
 
-        new_status_text = MESSAGES["processing_with_cache"].format(
-            progress_bar=progress_bar,
-            processed=processed,
-            total=total,
-            percent=percent,
-            found=found_count,
-            from_cache=from_cache,
-            new_checks=new_checks_count,
-            not_found=not_found_count,
-            time=format_time()
-        )
+        # Обновляем статус каждые 5 обработанных ссылок
+        if new_checks_count % 5 == 0:
+            progress_bar = create_progress_bar(processed, total)
+            percent = int((processed / total) * 100)
 
-        if new_status_text != last_status_text:
-            await safe_edit_message(status, new_status_text, reply_markup=processing_menu_kb())
-            last_status_text = new_status_text
+            # Добавляем информацию о скорости
+            elapsed = time.time() - start_time
+            speed = new_checks_count / elapsed if elapsed > 0 else 0
+            eta = (total - processed) / speed if speed > 0 else 0
+
+            new_status_text = f"""⚡ <b>Обработка данных (Турбо-режим 10x)</b>
+
+{progress_bar}
+<b>Прогресс:</b> {processed}/{total} ({percent}%)
+
+📊 <b>Статистика:</b>
+✅ Найдено данных: {found_count}
+💾 Из кеша: {from_cache}
+🔍 Новых проверок: {new_checks_count}
+❌ Без результата: {not_found_count}
+
+⚡ <b>Скорость:</b> {speed:.1f} ссылок/сек
+⏱ <b>Осталось:</b> ~{int(eta)} сек
+
+<i>Обновлено: {format_time()}</i>"""
+
+            if new_status_text != last_status_text:
+                await safe_edit_message(status, new_status_text, reply_markup=processing_menu_kb())
+                last_status_text = new_status_text
 
     async def limit_cb():
         # Сохраняем прогресс при достижении лимита
-        session = await get_user_session(user_id)
         session["partial_results"] = all_results
+        session["links_order"] = links_to_process
         await save_user_session(user_id, session)
 
         limit_message = MESSAGES["limit_reached"].format(
@@ -1786,8 +1980,14 @@ async def start_processing(
 
         await status.edit_text(limit_message, reply_markup=continue_kb())
 
-    # Запускаем VK Worker
-    worker = VKWorker(queue, result_cb, limit_cb)
+    # Запускаем MultiVKWorker
+    worker = MultiVKWorker(
+        queue,
+        result_cb,
+        limit_cb,
+        admin_notification_callback=notify_admins
+    )
+
     await worker.start()
     await queue.join()
 
@@ -1799,10 +1999,16 @@ async def start_processing(
 async def finish_processing(
         message: types.Message,
         results: Dict[str, Dict],
-        processor: ExcelProcessor,
+        processor: ExcelProcessor,  # Передается как параметр
         links_order: List[str],
         user_id: int
 ):
+    # Если processor None, пытаемся создать из файла в сессии
+    if processor is None:
+        session = await get_user_session(user_id)
+        if session and session.get('temp_file'):
+            processor = ExcelProcessor()
+            processor.load_excel_file(pathlib.Path(session['temp_file']))
     """Завершает обработку и отправляет результаты"""
 
     # Генерируем имя файла
@@ -1813,9 +2019,20 @@ async def finish_processing(
     success = processor.save_results_to_excel(results, output_path)
 
     if success:
-        # Подсчитываем статистику
-        found_count = sum(1 for data in results.values() if data.get("phones"))
-        not_found_count = len(results) - found_count
+        # Правильный подсчет статистики
+        found_count = 0
+        not_found_count = 0
+
+        for data in results.values():
+            # Проверяем есть ли хоть какие-то данные
+            has_phones = bool(data.get("phones", []))
+            has_name = bool(data.get("full_name", ""))
+            has_birth = bool(data.get("birth_date", ""))
+
+            if has_phones or has_name or has_birth:
+                found_count += 1
+            else:
+                not_found_count += 1
 
         # Отправляем сообщение о завершении
         complete_text = MESSAGES["session_complete"].format(
