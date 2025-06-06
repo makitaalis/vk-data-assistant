@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Dict, Any, Optional
 import redis.asyncio as redis
+import pickle
+import base64
 
 from bot.config import (
     REDIS_URL,
@@ -34,13 +36,44 @@ async def init_redis():
         return
 
     try:
-        redis_client = await redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client = await redis.from_url(REDIS_URL, decode_responses=False)
         await redis_client.ping()
         logger.info("✅ Redis подключен успешно")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к Redis: {e}")
         logger.warning("⚠️ Работаем без Redis (сессии в памяти)")
         redis_client = None
+
+
+def serialize_session(session_data: Dict[str, Any]) -> str:
+    """Сериализация сессии для сохранения"""
+    # Создаем копию данных для сериализации
+    clean_data = {}
+
+    for key, value in session_data.items():
+        # Пропускаем несериализуемые объекты
+        if key in ['processor', 'analyzer']:
+            continue
+
+        # Для duplicate_check сохраняем только необходимые данные
+        if key == 'duplicate_check' and isinstance(value, dict):
+            clean_data[key] = {
+                'new': value.get('new', []),
+                'duplicates_with_data': list(value.get('duplicates_with_data', {}).keys()),
+                'duplicates_no_data': value.get('duplicates_no_data', [])
+            }
+        else:
+            clean_data[key] = value
+
+    return json.dumps(clean_data, ensure_ascii=False)
+
+
+def deserialize_session(session_str: str) -> Dict[str, Any]:
+    """Десериализация сессии"""
+    try:
+        return json.loads(session_str)
+    except:
+        return {}
 
 
 async def get_user_session(user_id: int) -> Dict[str, Any]:
@@ -51,7 +84,7 @@ async def get_user_session(user_id: int) -> Dict[str, Any]:
         try:
             session_data = await redis_client.get(session_key)
             if session_data:
-                return json.loads(session_data)
+                return deserialize_session(session_data.decode('utf-8'))
         except Exception as e:
             logger.error(f"Ошибка чтения из Redis: {e}")
 
@@ -65,10 +98,11 @@ async def save_user_session(user_id: int, session_data: Dict[str, Any]):
 
     if redis_client:
         try:
+            serialized = serialize_session(session_data)
             await redis_client.setex(
                 session_key,
                 REDIS_SESSION_TTL,
-                json.dumps(session_data, ensure_ascii=False)
+                serialized.encode('utf-8')
             )
             return
         except Exception as e:
@@ -100,13 +134,12 @@ async def check_user_accepted_disclaimer(user_id: int) -> bool:
         try:
             accepted = await redis_client.get(f"{REDIS_DISCLAIMER_PREFIX}{user_id}")
             if accepted:
-                return accepted == "1"
+                return accepted.decode('utf-8') == "1"
         except Exception:
             pass
     elif user_id in local_disclaimers:
         return local_disclaimers[user_id]
 
-    # Если нет в кеше, проверяем БД (будет передана через dependency injection)
     return False
 
 
@@ -118,7 +151,7 @@ async def set_user_accepted_disclaimer(user_id: int, user_data: Optional[Dict] =
             await redis_client.setex(
                 f"{REDIS_DISCLAIMER_PREFIX}{user_id}",
                 REDIS_DISCLAIMER_TTL,
-                "1"
+                "1".encode('utf-8')
             )
         except Exception:
             pass

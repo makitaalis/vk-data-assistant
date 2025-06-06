@@ -35,8 +35,6 @@ from bot.utils.session_manager import (
     check_user_accepted_disclaimer
 )
 from bot.utils.export import create_excel_from_results
-from db_module import VKDatabase
-from services.vk_service import VKService
 from services.excel_service import ExcelProcessor
 
 router = Router()
@@ -44,8 +42,12 @@ logger = logging.getLogger("search_handler")
 
 
 @router.message(Command("findphone"))
-async def cmd_find_phone(msg: Message, db: VKDatabase):
+async def cmd_find_phone(msg: Message, db):
     """Поиск по номеру телефона"""
+    if not db:
+        await msg.answer("❌ Сервис временно недоступен")
+        return
+
     # Извлекаем номер из команды
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -106,7 +108,7 @@ async def on_search_phone(call: CallbackQuery):
 
 
 @router.message(F.text)
-async def on_text_message(msg: Message, db: VKDatabase):
+async def on_text_message(msg: Message, db, vk_service, bot):
     """Обработка текстовых сообщений с ссылками или телефонами"""
     user_id = msg.from_user.id
 
@@ -215,7 +217,7 @@ async def on_text_message(msg: Message, db: VKDatabase):
     else:
         # Если дубликатов нет, сразу начинаем обработку
         await msg.answer(f"📤 Начинаю обработку {len(links)} ссылок...")
-        await start_processing(msg, links, None, duplicate_check, user_id, db)
+        await start_processing(msg, links, None, duplicate_check, user_id, db, vk_service, bot)
 
 
 async def start_processing(
@@ -224,11 +226,15 @@ async def start_processing(
         processor: ExcelProcessor,
         duplicate_check: Dict,
         user_id: int,
-        db: VKDatabase,
-        vk_service: VKService = None,
+        db,
+        vk_service=None,
         bot=None
 ):
     """Запускает обработку ссылок с учетом кеша"""
+
+    if not db:
+        await message.answer("❌ Сервис временно недоступен")
+        return
 
     # Получаем закешированные результаты
     cached_results = await db.get_cached_results(links_to_process)
@@ -270,6 +276,14 @@ async def start_processing(
     # Если все результаты из кеша
     if not links_to_check:
         await finish_processing(message, all_results, processor, links_to_process, user_id, db, bot)
+        return
+
+    # Проверяем наличие vk_service
+    if not vk_service:
+        await status.edit_text(
+            "❌ VK сервис недоступен. Могу показать только результаты из кеша.",
+            reply_markup=finish_kb()
+        )
         return
 
     # Создаем очередь для новых проверок
@@ -350,13 +364,8 @@ async def start_processing(
 
         await status.edit_text(limit_message, reply_markup=continue_kb())
 
-    # Если VK сервис не передан, значит это прямые ссылки
-    if vk_service:
-        await vk_service.process_queue(queue, result_cb, limit_cb)
-    else:
-        # Для прямых ссылок нужно будет инициализировать VK сервис
-        # Это будет сделано в главном файле
-        pass
+    # Запускаем обработку
+    await vk_service.process_queue(queue, result_cb, limit_cb)
 
     # Обработка завершена успешно
     await finish_processing(message, all_results, processor, links_to_process, user_id, db, bot)
@@ -368,7 +377,7 @@ async def finish_processing(
         processor: ExcelProcessor,
         links_order: List[str],
         user_id: int,
-        db: VKDatabase,
+        db,
         bot=None
 ):
     """Завершает обработку и отправляет результаты"""

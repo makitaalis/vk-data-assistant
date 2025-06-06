@@ -25,7 +25,6 @@ from bot.utils.session_manager import (
 )
 from bot.utils.export import create_excel_from_results, create_json_report
 from bot.handlers.search import start_processing
-from db_module import VKDatabase
 from services.analysis_service import FileAnalyzer
 
 router = Router()
@@ -141,8 +140,12 @@ async def on_continue(call: CallbackQuery):
 
 # Обработчики дубликатов
 @router.callback_query(F.data == "remove_duplicates")
-async def on_remove_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
     """Удаление дубликатов из обработки"""
+    if not db:
+        await call.answer("❌ Сервис временно недоступен", show_alert=True)
+        return
+
     await call.answer("🗑 Удаляю дубликаты...")
     user_id = call.from_user.id
     session = await get_user_session(user_id)
@@ -151,10 +154,10 @@ async def on_remove_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, 
         await call.message.edit_text(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    duplicate_check = session["duplicate_check"]
+    duplicate_check = session.get("duplicate_check", {})
 
     # Оставляем только новые ссылки
-    links_to_process = duplicate_check["new"]
+    links_to_process = duplicate_check.get("new", [])
 
     if not links_to_process:
         await call.message.edit_text(
@@ -169,16 +172,18 @@ async def on_remove_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, 
         f"Будет обработано: {len(links_to_process)} новых ссылок"
     )
 
-    # Получаем processor из сессии
-    processor = session.get("processor")
-
     # Запускаем обработку только новых ссылок
-    await start_processing(call.message, links_to_process, processor, duplicate_check, user_id, db, vk_service, bot)
+    # Не передаем processor в start_processing - он не нужен для прямых ссылок
+    await start_processing(call.message, links_to_process, None, duplicate_check, user_id, db, vk_service, bot)
 
 
 @router.callback_query(F.data == "keep_all")
-async def on_keep_all(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+async def on_keep_all(call: CallbackQuery, db, vk_service, bot):
     """Обработка всех ссылок включая дубликаты"""
+    if not db:
+        await call.answer("❌ Сервис временно недоступен", show_alert=True)
+        return
+
     await call.answer("📋 Обрабатываю все ссылки...")
     user_id = call.from_user.id
     session = await get_user_session(user_id)
@@ -188,18 +193,19 @@ async def on_keep_all(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         return
 
     await call.message.edit_text(
-        f"✅ Начинаю обработку всех {len(session['all_links'])} ссылок\n\n"
+        f"✅ Начинаю обработку всех {len(session.get('all_links', []))} ссылок\n\n"
         f"<i>Данные из кеша будут использованы автоматически</i>"
     )
 
-    processor = session.get("processor")
-    duplicate_check = session.get("duplicate_check")
+    # Получаем данные из сессии
+    all_links = session.get("all_links", [])
+    duplicate_check = session.get("duplicate_check", {})
 
     # Запускаем обработку всех ссылок
     await start_processing(
         call.message,
-        session["all_links"],
-        processor,
+        all_links,
+        None,  # processor не нужен для прямых ссылок
         duplicate_check,
         user_id,
         db,
@@ -209,8 +215,12 @@ async def on_keep_all(call: CallbackQuery, db: VKDatabase, vk_service, bot):
 
 
 @router.callback_query(F.data == "update_duplicates")
-async def on_update_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
     """Обновление данных дубликатов"""
+    if not db:
+        await call.answer("❌ Сервис временно недоступен", show_alert=True)
+        return
+
     await call.answer("🔄 Обновляю данные...")
     user_id = call.from_user.id
     session = await get_user_session(user_id)
@@ -219,10 +229,10 @@ async def on_update_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, 
         await call.message.edit_text(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    duplicate_check = session["duplicate_check"]
+    duplicate_check = session.get("duplicate_check", {})
 
     # Будем перепроверять только дубликаты без данных
-    links_to_update = duplicate_check["duplicates_no_data"]
+    links_to_update = duplicate_check.get("duplicates_no_data", [])
 
     if not links_to_update:
         await call.message.edit_text(
@@ -236,10 +246,8 @@ async def on_update_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, 
         f"🔄 Обновляю данные для {len(links_to_update)} ссылок без результатов"
     )
 
-    processor = session.get("processor")
-
     # Запускаем обработку
-    await start_processing(call.message, links_to_update, processor, duplicate_check, user_id, db, vk_service, bot)
+    await start_processing(call.message, links_to_update, None, duplicate_check, user_id, db, vk_service, bot)
 
 
 @router.callback_query(F.data == "cancel_processing")
@@ -257,7 +265,7 @@ async def on_cancel_processing(call: CallbackQuery):
 
 # Обработчики анализа файлов
 @router.callback_query(F.data == "analysis_details")
-async def on_analysis_details(call: CallbackQuery):
+async def on_analysis_details(call: CallbackQuery, db):
     """Показ деталей анализа"""
     await call.answer()
     user_id = call.from_user.id
@@ -268,7 +276,7 @@ async def on_analysis_details(call: CallbackQuery):
         return
 
     analysis = session['analysis_result']
-    analyzer = FileAnalyzer(None)  # DB не нужна для форматирования
+    analyzer = FileAnalyzer(db)
     details_text = await analyzer.format_analysis_details(analysis)
 
     # Отправляем новое сообщение с деталями

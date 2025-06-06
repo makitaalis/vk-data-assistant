@@ -32,11 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot_main")
 
-# Глобальные объекты
-db: VKDatabase = None
-vk_service: VKService = None
-bot: Bot = None
-
 
 async def setup_bot_commands(bot: Bot):
     """Настройка команд бота"""
@@ -53,7 +48,10 @@ async def setup_bot_commands(bot: Bot):
     # Добавляем команды для админов
     admin_commands = commands + [
         BotCommand(command="botstatus", description="🤖 Статус VK ботов"),
-        BotCommand(command="debug", description="🐛 Отладочная информация")
+        BotCommand(command="debug", description="🐛 Отладочная информация"),
+        BotCommand(command="dbstats", description="📊 Статистика БД"),
+        BotCommand(command="broadcast", description="📢 Рассылка"),
+        BotCommand(command="top", description="🏆 Топ пользователей")
     ]
 
     # Устанавливаем команды для обычных пользователей
@@ -93,13 +91,8 @@ async def notify_admins(bot: Bot, message: str):
             logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
 
-async def on_startup(dispatcher: Dispatcher):
-    """Действия при запуске бота"""
-    global db, vk_service
-
-    # Получаем bot из диспетчера
-    bot = dispatcher["bot"]
-
+async def main():
+    """Основная функция запуска"""
     # Инициализация структуры проекта
     init_project_structure()
 
@@ -120,45 +113,6 @@ async def on_startup(dispatcher: Dispatcher):
     balance = await vk_service.check_balance()
     if balance:
         logger.info(f"💰 Баланс VK бота: {balance} поисков")
-        if balance < 50:
-            await notify_admins(bot, f"⚠️ Низкий баланс VK бота: {balance} поисков!")
-
-    # Настройка команд бота
-    await setup_bot_commands(bot)
-
-    # Уведомление админов о запуске
-    await notify_admins(bot, "✅ Бот запущен и готов к работе!")
-
-    logger.info("✅ Бот успешно запущен")
-
-
-async def on_shutdown(dispatcher: Dispatcher):
-    """Действия при остановке бота"""
-    global vk_service, db
-
-    # Получаем bot из диспетчера
-    bot = dispatcher["bot"]
-
-    # Закрываем VK сервис
-    if vk_service:
-        await vk_service.close()
-
-    # Закрываем соединение с Redis
-    await close_redis()
-
-    # Закрываем соединение с БД
-    if db:
-        await db.close()
-
-    # Уведомляем админов
-    await notify_admins(bot, "👋 Бот остановлен")
-
-    logger.info("👋 Бот остановлен")
-
-
-async def main():
-    """Основная функция запуска"""
-    global bot
 
     # Создаем бота
     bot = Bot(
@@ -169,9 +123,10 @@ async def main():
     # Создаем диспетчер
     dp = Dispatcher()
 
-    # Подключаем middleware
-    dp.message.middleware(AuthMiddleware())
-    dp.callback_query.middleware(AuthMiddleware())
+    # Подключаем middleware с зависимостями
+    auth_middleware = AuthMiddleware(db, vk_service)
+    dp.message.middleware(auth_middleware)
+    dp.callback_query.middleware(auth_middleware)
 
     # Регистрируем роутеры
     dp.include_router(start.router)
@@ -181,22 +136,25 @@ async def main():
     dp.include_router(callbacks.router)
     dp.include_router(stats.router)
 
-    # Делаем объекты доступными для хендлеров через контекст
-    dp["db"] = db
-    dp["vk_service"] = vk_service
-    dp["bot"] = bot
+    # Настройка команд бота
+    await setup_bot_commands(bot)
 
-    # Регистрируем хендлеры жизненного цикла
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
+    # Уведомление админов о запуске
+    await notify_admins(bot, "✅ Бот запущен и готов к работе!")
 
-    # Запускаем поллинг
+    logger.info("✅ Бот успешно запущен")
+
     try:
+        # Запускаем поллинг
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         raise
     finally:
+        # Закрываем соединения
+        await vk_service.close()
+        await close_redis()
+        await db.close()
         await bot.session.close()
 
 

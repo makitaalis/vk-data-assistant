@@ -2,7 +2,7 @@
 
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, TelegramObject
 
 from bot.utils.session_manager import check_user_accepted_disclaimer
 from bot.utils.messages import MESSAGES
@@ -16,16 +16,28 @@ class AuthMiddleware(BaseMiddleware):
     ALLOWED_COMMANDS = ["/start"]
     ALLOWED_CALLBACKS = ["accept_disclaimer", "reject_disclaimer"]
 
+    def __init__(self, db, vk_service):
+        """Инициализация с зависимостями"""
+        self.db = db
+        self.vk_service = vk_service
+
     async def __call__(
             self,
-            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-            event: Message | CallbackQuery,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
         """Обработка события"""
 
+        # Добавляем зависимости в data
+        data["db"] = self.db
+        data["vk_service"] = self.vk_service
+
         # Получаем user_id
-        user = event.from_user
+        user = None
+        if isinstance(event, (Message, CallbackQuery)):
+            user = event.from_user
+
         if not user:
             return await handler(event, data)
 
@@ -45,13 +57,11 @@ class AuthMiddleware(BaseMiddleware):
                 return await handler(event, data)
 
         # Проверяем, принял ли пользователь условия
-        # Сначала проверяем в кеше/Redis
         accepted = await check_user_accepted_disclaimer(user_id)
 
         # Если не принял, проверяем в БД
-        if not accepted and "db" in data:
-            db = data["db"]
-            accepted = await db.check_user_accepted_disclaimer(user_id)
+        if not accepted and self.db:
+            accepted = await self.db.check_user_accepted_disclaimer(user_id)
 
         if not accepted:
             # Отправляем disclaimer
