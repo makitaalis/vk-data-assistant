@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from bot.main import main
-
+from services.logger_service import setup_logger
 
 def setup_logging():
     """Настройка логирования"""
