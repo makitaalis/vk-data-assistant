@@ -9,6 +9,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat
 
 from bot.config import (
     BOT_TOKEN,
+    VK_BOT_USERNAME,
     API_ID,
     API_HASH,
     SESSION_NAME,
@@ -47,7 +48,7 @@ async def setup_bot_commands(bot: Bot):
 
     # Добавляем команды для админов
     admin_commands = commands + [
-        BotCommand(command="botstatus", description="🤖 Статус VK ботов"),
+        BotCommand(command="botstatus", description="🤖 Статус VK бота"),
         BotCommand(command="debug", description="🐛 Отладочная информация"),
         BotCommand(command="dbstats", description="📊 Статистика БД"),
         BotCommand(command="broadcast", description="📢 Рассылка"),
@@ -105,7 +106,7 @@ async def main():
     await init_redis()
 
     # Инициализация VK сервиса
-    logger.info("🔄 Инициализация VK сервиса...")
+    logger.info(f"🔄 Инициализация VK сервиса с ботом @{VK_BOT_USERNAME}...")
     vk_service = VKService(API_ID, API_HASH, SESSION_NAME, ACCOUNT_PHONE)
     await vk_service.initialize()
 
@@ -113,6 +114,8 @@ async def main():
     balance = await vk_service.check_balance()
     if balance:
         logger.info(f"💰 Баланс VK бота: {balance} поисков")
+    else:
+        logger.warning("⚠️ Не удалось получить баланс бота")
 
     # Создаем бота
     bot = Bot(
@@ -140,7 +143,12 @@ async def main():
     await setup_bot_commands(bot)
 
     # Уведомление админов о запуске
-    await notify_admins(bot, "✅ Бот запущен и готов к работе!")
+    startup_message = f"✅ Бот запущен и готов к работе!\n\n"
+    startup_message += f"🤖 Используется VK бот: @{VK_BOT_USERNAME}"
+    if balance:
+        startup_message += f"\n💰 Доступно поисков: {balance}"
+
+    await notify_admins(bot, startup_message)
 
     logger.info("✅ Бот успешно запущен")
 

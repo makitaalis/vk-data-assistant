@@ -1,34 +1,33 @@
 """Обработчики для работы с файлами"""
 
-import tempfile
 import logging
+import tempfile
+# Также убедитесь, что есть эти импорты:
 from pathlib import Path
-import pandas as pd
 
+import pandas as pd
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery
 
 from bot.config import ADMIN_IDS, MAX_LINKS_PER_FILE
-from bot.utils.messages import MESSAGES
+from bot.handlers.search import start_processing
+from bot.keyboards.inline import duplicate_actions_kb
 from bot.keyboards.inline import (
     main_menu_kb,
     back_to_menu_kb,
     file_action_menu_kb,
-    analysis_results_kb,
-    duplicate_actions_kb,
-    db_load_menu_kb
+    analysis_results_kb
 )
+from bot.utils.messages import MESSAGES
 from bot.utils.session_manager import (
     get_user_session,
-    save_user_session,
     clear_user_session
 )
-from bot.utils.helpers import format_time
-from bot.handlers.search import start_processing
-from db_module import VKDatabase
-from services.excel_service import ExcelProcessor
-from services.analysis_service import FileAnalyzer
+from bot.utils.session_manager import save_user_session
 from db_loader import DatabaseLoader
+from db_module import VKDatabase
+from services.analysis_service import FileAnalyzer
+from services.excel_service import ExcelProcessor
 
 router = Router()
 logger = logging.getLogger("files_handler")
@@ -266,6 +265,11 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
             MESSAGES["error_no_vk_links"],
             reply_markup=main_menu_kb(user_id, ADMIN_IDS)
         )
+        return
+
+    # НОВОЕ: Проверяем баланс перед обработкой
+    from bot.handlers.balance import check_balance_before_processing
+    if not await check_balance_before_processing(call.message, len(links), vk_service):
         return
 
     # Сохраняем информацию в сессию

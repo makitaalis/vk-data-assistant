@@ -205,9 +205,20 @@ class VKDatabase:
 
             existing_links = {}
             for row in rows:
+                # Обработка phones из JSONB
+                phones = row["phones"]
+                if phones is None:
+                    phones = []
+                elif isinstance(phones, str):
+                    try:
+                        import json
+                        phones = json.loads(phones)
+                    except:
+                        phones = []
+
                 link_data = {
                     "link": row["link"],
-                    "phones": row["phones"] or [],
+                    "phones": phones,
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or "",
                     "found_data": row["found_data"]
@@ -319,9 +330,20 @@ class VKDatabase:
             """, phone)
 
             for row in rows:
+                # Обработка phones из JSONB
+                phones = row["phones"]
+                if phones is None:
+                    phones = []
+                elif isinstance(phones, str):
+                    try:
+                        import json
+                        phones = json.loads(phones)
+                    except:
+                        phones = []
+
                 results.append({
                     "link": row["link"],
-                    "phones": row["phones"] or [],
+                    "phones": phones,
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or "",
                     "checked_at": row["checked_at"]
@@ -389,8 +411,20 @@ class VKDatabase:
             """, links)
 
             for row in rows:
+                # Обработка phones - PostgreSQL JSONB возвращает уже распарсенный список
+                phones = row["phones"]
+                if phones is None:
+                    phones = []
+                elif isinstance(phones, str):
+                    # На всякий случай, если вернулась строка
+                    try:
+                        import json
+                        phones = json.loads(phones)
+                    except:
+                        phones = []
+
                 results[row["link"]] = {
-                    "phones": row["phones"] or [],
+                    "phones": phones,
                     "full_name": row["full_name"] or "",
                     "birth_date": row["birth_date"] or ""
                 }

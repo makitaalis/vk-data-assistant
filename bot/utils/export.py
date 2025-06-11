@@ -40,10 +40,34 @@ async def create_excel_from_results(
         for link in links_order:
             result_data = all_results.get(link, {})
 
-            # Извлекаем данные
+            # Извлекаем данные с проверкой типов
             phones = result_data.get("phones", [])
+
+            # Обработка phones - убедимся что это список
+            if phones is None:
+                phones = []
+            elif isinstance(phones, str):
+                # Если строка, пробуем распарсить JSON
+                if phones.startswith('['):
+                    try:
+                        phones = json.loads(phones)
+                    except:
+                        phones = []
+                else:
+                    # Если просто строка с номером
+                    phones = [phones] if phones else []
+            elif not isinstance(phones, list):
+                phones = []
+
+            # Убедимся что элементы списка - строки
+            phones = [str(p) for p in phones if p]
+
             full_name = result_data.get("full_name", "")
             birth_date = result_data.get("birth_date", "")
+
+            # Преобразуем в строки, обрабатывая None
+            full_name = str(full_name) if full_name is not None else ""
+            birth_date = str(birth_date) if birth_date is not None else ""
 
             # Создаем словарь для строки
             row_data = {
@@ -131,6 +155,23 @@ async def create_excel_from_results(
                 data = all_results.get(link, {})
                 if data.get("phones") or data.get("full_name") or data.get("birth_date"):
                     phones = data.get("phones", [])
+
+                    # Обработка phones
+                    if phones is None:
+                        phones = []
+                    elif isinstance(phones, str):
+                        if phones.startswith('['):
+                            try:
+                                phones = json.loads(phones)
+                            except:
+                                phones = []
+                        else:
+                            phones = [phones] if phones else []
+                    elif not isinstance(phones, list):
+                        phones = []
+
+                    phones = [str(p) for p in phones if p]
+
                     row_data = {
                         "Ссылка VK": link,
                         "Телефон 1": phones[0] if len(phones) > 0 else "",

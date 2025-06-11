@@ -2,39 +2,36 @@
 
 import asyncio
 import logging
-import time
 import re
+# Также нужно добавить эти импорты, если их еще нет:
+import time
 from typing import Dict, Any, List
-from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from bot.config import ADMIN_IDS, VK_LINK_PATTERN
-from bot.utils.messages import MESSAGES
+from bot.config import ADMIN_IDS
+from bot.keyboards.inline import finish_kb, continue_kb, processing_menu_kb
 from bot.keyboards.inline import (
     main_menu_kb,
     back_to_menu_kb,
-    processing_menu_kb,
-    finish_kb,
-    continue_kb,
     duplicate_actions_kb, disclaimer_kb
 )
+from bot.utils.export import create_excel_from_results
 from bot.utils.helpers import (
     create_progress_bar,
     format_time,
-    safe_edit_message,
-    validate_vk_link,
     extract_vk_links
 )
+from bot.utils.helpers import safe_edit_message
+from bot.utils.messages import MESSAGES
 from bot.utils.session_manager import (
     get_user_session,
-    save_user_session,
     clear_user_session,
     check_user_accepted_disclaimer
 )
-from bot.utils.export import create_excel_from_results
+from bot.utils.session_manager import save_user_session
 from services.excel_service import ExcelProcessor
 
 router = Router()
@@ -230,11 +227,17 @@ async def start_processing(
         vk_service=None,
         bot=None
 ):
-    """Запускает обработку ссылок с учетом кеша"""
+    """Запускает обработку ссылок с учетом кеша и проверкой баланса"""
 
     if not db:
         await message.answer("❌ Сервис временно недоступен")
         return
+
+    # НОВОЕ: Проверяем баланс перед началом обработки
+    from bot.handlers.balance import check_balance_before_processing, is_processing_paused
+    links_count = len(links_to_process)
+    if not await check_balance_before_processing(message, links_count, vk_service):
+        return  # Прерываем если недостаточно поисков
 
     # Получаем закешированные результаты
     cached_results = await db.get_cached_results(links_to_process)
@@ -298,6 +301,10 @@ async def start_processing(
     async def result_cb(link: str, result_data: Dict[str, Any]):
         nonlocal new_checks_count, last_status_text
 
+        # НОВОЕ: Ждем если обработка приостановлена для проверки баланса
+        while is_processing_paused():
+            await asyncio.sleep(0.5)
+
         # Сохраняем результат
         all_results[link] = result_data
 
@@ -321,8 +328,8 @@ async def start_processing(
             else:
                 not_found_count += 1
 
-        # Обновляем статус каждые 5 обработанных ссылок
-        if new_checks_count % 5 == 0:
+        # Обновляем статус каждые 3 обработанных ссылки
+        if new_checks_count % 3 == 0 or processed == total:
             progress_bar = create_progress_bar(processed, total)
             percent = int((processed / total) * 100)
 

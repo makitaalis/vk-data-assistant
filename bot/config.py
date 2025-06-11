@@ -8,6 +8,9 @@ load_dotenv()
 # ===== Telegram Bot Configuration =====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+# ===== VK Bot Configuration =====
+VK_BOT_USERNAME = os.environ.get("VK_BOT_USERNAME", "eye_of_god_bot")
+
 # ===== Telethon Configuration =====
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
@@ -52,6 +55,9 @@ SAVE_INTERVAL = 5  # Сохранять каждые N обработанных 
 MAX_LINKS_PER_FILE = 5000  # Максимум ссылок в одном файле
 MAX_LINKS_PER_MESSAGE = 100  # Максимум ссылок в одном сообщении
 MESSAGE_TIMEOUT = 15.0  # Таймаут ожидания ответа от VK бота
+INITIAL_DELAY = 2.0  # Начальная задержка после отправки
+RETRY_DELAY = 1.0  # Задержка между попытками
+MAX_RETRIES = 3  # Максимум попыток
 
 # ===== Patterns =====
 VK_LINK_PATTERN = r'https?://(?:www\.)?(?:vk\.com|m\.vk\.com)/(?:id\d+|[a-zA-Z0-9_\.]+)'
@@ -65,7 +71,6 @@ REDIS_DISCLAIMER_TTL = 2592000  # 30 дней
 
 # ===== Feature Flags =====
 USE_REDIS = True  # Использовать Redis для сессий
-USE_BOT_POOL = False  # Использовать пул ботов (отключено - работаем с 1 ботом)
 ENABLE_DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 
 # ===== Rate Limiting =====

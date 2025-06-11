@@ -3,13 +3,14 @@ import logging
 import re
 import time
 from typing import Dict, Any, Optional, Callable, Coroutine
+
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetHistoryRequest
 
 logger = logging.getLogger("vk_service")
 
 # Константы
-VK_BOT_USERNAME = "sherlock_XIS_bot"  # Основной бот
+VK_BOT_USERNAME = "vk_memosimo_3_bot"  # Основной бот
 MESSAGE_TIMEOUT = 15.0  # Увеличиваем таймаут
 INITIAL_DELAY = 2.0
 RETRY_DELAY = 1.0
@@ -232,6 +233,78 @@ class VKService:
 
         return phones[:4]
 
+    async def check_balance(self) -> Optional[int]:
+        """Проверка баланса поисков через кнопку 'Мой профиль'"""
+        if not self.is_initialized:
+            raise RuntimeError("VKService не инициализирован")
+
+        try:
+            # Очищаем предыдущие результаты
+            self.result_event.clear()
+            self.current_result = None
+
+            # Для vk_memosimo_3_bot нужно нажать кнопку "Мой профиль"
+            # Сначала попробуем отправить команду /start для получения меню
+            await self.client.send_message(self.bot_entity, "/start")
+            await asyncio.sleep(1)
+
+            # Теперь нажимаем кнопку "Мой профиль"
+            # Получаем последнее сообщение с кнопками
+            messages = await self.client(GetHistoryRequest(
+                peer=self.bot_entity,
+                limit=5,
+                offset_date=None,
+                offset_id=0,
+                max_id=0,
+                min_id=0,
+                add_offset=0,
+                hash=0
+            ))
+
+            # Ищем сообщение с inline кнопками
+            for msg in messages.messages:
+                if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+                    for row in msg.reply_markup.rows:
+                        for button in row.buttons:
+                            if hasattr(button, 'text') and 'профиль' in button.text.lower():
+                                # Нажимаем на кнопку
+                                await msg.click(data=button.data)
+                                logger.info("✅ Нажата кнопка 'Мой профиль'")
+                                await asyncio.sleep(2)
+                                break
+
+            # Получаем обновленные сообщения после нажатия кнопки
+            messages = await self.client(GetHistoryRequest(
+                peer=self.bot_entity,
+                limit=10,
+                offset_date=None,
+                offset_id=0,
+                max_id=0,
+                min_id=0,
+                add_offset=0,
+                hash=0
+            ))
+
+            # Ищем сообщение с балансом
+            for msg in messages.messages:
+                if msg.text and "Доступно поисков:" in msg.text:
+                    # Парсим количество поисков
+                    match = re.search(r'Доступно поисков:\s*(\d+)', msg.text)
+                    if match:
+                        balance = int(match.group(1))
+                        logger.info(f"✅ Получен баланс: {balance} поисков")
+                        return balance
+
+            logger.warning("⚠️ Не удалось найти информацию о балансе в ответе")
+            return None
+
+        except asyncio.TimeoutError:
+            logger.error("⏱ Таймаут при проверке баланса")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка при проверке баланса: {e}")
+            return None
+
     async def search_vk_link(self, link: str) -> Dict[str, Any]:
         """Поиск данных по VK ссылке"""
         if not self.is_initialized:
@@ -311,44 +384,13 @@ class VKService:
 
         return None
 
-    async def check_balance(self) -> Optional[int]:
-        """Проверка баланса поисков"""
-        try:
-            # Отправляем команду /profile
-            await self.client.send_message(self.bot_entity, "/profile")
-            await asyncio.sleep(1)
-
-            # Получаем сообщения
-            messages = await self.client(GetHistoryRequest(
-                peer=self.bot_entity,
-                limit=5,
-                offset_date=None,
-                offset_id=0,
-                max_id=0,
-                min_id=0,
-                add_offset=0,
-                hash=0
-            ))
-
-            # Ищем сообщение с балансом
-            for msg in messages.messages:
-                if msg.text and "Доступно поисков:" in msg.text:
-                    match = re.search(r'Доступно поисков:\s*(\d+)', msg.text)
-                    if match:
-                        return int(match.group(1))
-
-        except Exception as e:
-            logger.error(f"Ошибка при проверке баланса: {e}")
-
-        return None
-
     async def process_queue(
             self,
             queue: asyncio.Queue,
             result_callback: Callable[[str, Dict[str, Any]], Coroutine],
             limit_callback: Callable[[], Coroutine]
     ):
-        """Обработка очереди ссылок"""
+        """Обработка очереди ссылок с поддержкой паузы для проверки баланса"""
         total = queue.qsize()
         processed = 0
         start_time = time.time()
@@ -357,6 +399,15 @@ class VKService:
 
         while not queue.empty():
             try:
+                # НОВОЕ: Проверяем, не приостановлена ли обработка
+                # Импортируем функцию проверки паузы
+                from bot.handlers.balance import is_processing_paused
+
+                # Ждем пока обработка приостановлена
+                while is_processing_paused():
+                    logger.debug("⏸ Обработка приостановлена для проверки баланса")
+                    await asyncio.sleep(0.5)
+
                 link = await queue.get()
 
                 try:

@@ -16,7 +16,7 @@ def disclaimer_kb() -> InlineKeyboardMarkup:
 
 
 def main_menu_kb(user_id: int, admin_ids: list[int]) -> InlineKeyboardMarkup:
-    """Главное меню бота"""
+    """Главное меню бота с кнопкой Баланс"""
     keyboard = [
         [
             InlineKeyboardButton(text="📤 Загрузить файл", callback_data="upload_file"),
@@ -24,11 +24,14 @@ def main_menu_kb(user_id: int, admin_ids: list[int]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📊 Мои результаты", callback_data="my_results"),
-            InlineKeyboardButton(text="📚 Помощь", callback_data="help")
+            InlineKeyboardButton(text="💰 Баланс", callback_data="check_balance")
         ],
         [
             InlineKeyboardButton(text="🔍 Поиск по телефону", callback_data="search_phone"),
             InlineKeyboardButton(text="📈 Статистика", callback_data="user_stats")
+        ],
+        [
+            InlineKeyboardButton(text="📚 Помощь", callback_data="help")
         ]
     ]
 
@@ -41,6 +44,7 @@ def main_menu_kb(user_id: int, admin_ids: list[int]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     """Клавиатура для возврата в главное меню"""
     return InlineKeyboardMarkup(
@@ -51,14 +55,15 @@ def back_to_menu_kb() -> InlineKeyboardMarkup:
 
 
 def processing_menu_kb() -> InlineKeyboardMarkup:
-    """Меню во время обработки"""
+    """Меню во время обработки с кнопкой Баланс"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="⏸ Пауза", callback_data="pause"),
-                InlineKeyboardButton(text="📊 Статистика", callback_data="stats")
+                InlineKeyboardButton(text="💰 Баланс", callback_data="check_balance_processing")
             ],
             [
+                InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
                 InlineKeyboardButton(text="🚫 Отменить", callback_data="cancel")
             ]
         ]

@@ -7,7 +7,7 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 
-from bot.config import ADMIN_IDS
+from bot.config import ADMIN_IDS, VK_BOT_USERNAME
 from bot.utils.messages import MESSAGES
 from bot.keyboards.inline import (
     main_menu_kb,
@@ -47,6 +47,7 @@ async def cmd_bot_status(msg: Message, vk_service: VKService):
         status_text = f"""
 🤖 <b>Статус VK бота</b>
 
+📱 <b>Бот:</b> @{VK_BOT_USERNAME}
 💰 <b>Баланс:</b> {balance or 'Неизвестно'} поисков
 📊 <b>Обработано:</b> {vk_service.processed_count} ссылок
 ❌ <b>Ошибок:</b> {vk_service.error_count}
@@ -83,6 +84,8 @@ async def cmd_debug(msg: Message, db: VKDatabase):
 
     debug_info = f"""
 🐛 <b>Отладочная информация</b>
+
+<b>VK Бот:</b> @{VK_BOT_USERNAME}
 
 <b>Сессия пользователя:</b>
 - Ссылок всего: {len(session.get('links', []))}
