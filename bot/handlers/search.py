@@ -3,15 +3,17 @@
 import asyncio
 import logging
 import re
-# Также нужно добавить эти импорты, если их еще нет:
 import time
 from typing import Dict, Any, List
+import tempfile
+from pathlib import Path
+from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 
-from bot.config import ADMIN_IDS
+from bot.config import ADMIN_IDS, EXPORT_DATE_FORMAT
 from bot.keyboards.inline import finish_kb, continue_kb, processing_menu_kb
 from bot.keyboards.inline import (
     main_menu_kb,
@@ -29,9 +31,9 @@ from bot.utils.messages import MESSAGES
 from bot.utils.session_manager import (
     get_user_session,
     clear_user_session,
-    check_user_accepted_disclaimer
+    check_user_accepted_disclaimer,
+    save_user_session
 )
-from bot.utils.session_manager import save_user_session
 from services.excel_service import ExcelProcessor
 
 router = Router()
@@ -273,6 +275,7 @@ async def start_processing(
         "results": all_results,
         "links": links_to_process,
         "links_order": links_to_process,
+        "processor": processor  # Сохраняем processor в сессию
     }
     await save_user_session(user_id, session)
 
@@ -389,11 +392,45 @@ async def finish_processing(
 ):
     """Завершает обработку и отправляет результаты"""
 
-    # Генерируем файл с результатами
-    files = await create_excel_from_results(results, links_order)
+    # Получаем сессию для проверки наличия processor
+    session = await get_user_session(user_id)
 
-    if files:
-        # Правильный подсчет статистики
+    # Если processor не передан, пытаемся получить из сессии
+    if not processor and session:
+        processor = session.get('processor')
+
+    # Генерируем файлы с результатами
+    files_to_send = []
+
+    if processor and processor.original_df is not None:
+        # Если есть processor с исходными данными, используем его
+        temp_dir = Path(tempfile.mkdtemp())
+        ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
+        output_path = temp_dir / f"vk_data_complete_{ts}.xlsx"
+
+        # Сохраняем с исходными данными
+        success = processor.save_results_with_original_data(results, output_path)
+
+        if success:
+            # Подсчет статистики
+            found_count = sum(1 for data in results.values() if data.get("phones"))
+            not_found_count = len(links_order) - found_count
+
+            caption = f"""📊 Файл с результатами готов!
+
+✅ Обработано: {len(links_order)} ссылок
+📱 Найдены телефоны: {found_count}
+❌ Без телефонов: {not_found_count}
+
+💾 Все исходные данные сохранены!"""
+
+            files_to_send.append((output_path, caption))
+    else:
+        # Если нет processor, используем стандартный метод
+        files_to_send = await create_excel_from_results(results, links_order)
+
+    if files_to_send:
+        # Правильный подсчет статистики для сообщения о завершении
         found_count = 0
         not_found_count = 0
 
@@ -419,8 +456,7 @@ async def finish_processing(
 
         # Отправляем файлы
         if bot:
-            from aiogram.types import FSInputFile
-            for file_path, caption in files:
+            for file_path, caption in files_to_send:
                 try:
                     await bot.send_document(
                         message.chat.id,

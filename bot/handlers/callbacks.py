@@ -1,5 +1,3 @@
-"""Обработчики callback запросов"""
-
 import logging
 from pathlib import Path
 import tempfile
@@ -9,7 +7,7 @@ from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, FSInputFile
 
-from bot.config import ADMIN_IDS
+from bot.config import ADMIN_IDS, EXPORT_DATE_FORMAT
 from bot.utils.messages import MESSAGES
 from bot.keyboards.inline import (
     main_menu_kb,
@@ -82,11 +80,40 @@ async def on_download_results(call: CallbackQuery, bot):
 
     all_results = session.get("results", {})
     links_order = session.get("links_order", [])
+    processor = session.get("processor")  # Получаем processor из сессии
 
     # Генерируем файлы
-    files = await create_excel_from_results(all_results, links_order)
+    files_to_send = []
 
-    for file_path, caption in files:
+    if processor and processor.original_df is not None:
+        # Если есть processor с исходными данными, используем его
+        temp_dir = Path(tempfile.mkdtemp())
+        ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
+        output_path = temp_dir / f"vk_data_complete_{ts}.xlsx"
+
+        # Сохраняем с исходными данными
+        success = processor.save_results_with_original_data(all_results, output_path)
+
+        if success:
+            # Подсчет статистики
+            found_count = sum(1 for data in all_results.values() if data.get("phones"))
+            not_found_count = len(links_order) - found_count
+
+            caption = f"""📊 Файл с результатами готов!
+
+✅ Обработано: {len(links_order)} ссылок
+📱 Найдены телефоны: {found_count}
+❌ Без телефонов: {not_found_count}
+
+💾 Все исходные данные сохранены!"""
+
+            files_to_send.append((output_path, caption))
+    else:
+        # Если нет processor, используем стандартный метод
+        files_to_send = await create_excel_from_results(all_results, links_order)
+
+    # Отправляем файлы
+    for file_path, caption in files_to_send:
         try:
             await bot.send_document(
                 call.message.chat.id,
@@ -155,6 +182,7 @@ async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
         return
 
     duplicate_check = session.get("duplicate_check", {})
+    processor = session.get("processor")  # Получаем processor из сессии
 
     # Оставляем только новые ссылки
     links_to_process = duplicate_check.get("new", [])
@@ -172,9 +200,10 @@ async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
         f"Будет обработано: {len(links_to_process)} новых ссылок"
     )
 
-    # Запускаем обработку только новых ссылок
-    # Не передаем processor в start_processing - он не нужен для прямых ссылок
-    await start_processing(call.message, links_to_process, None, duplicate_check, user_id, db, vk_service, bot)
+    # Запускаем обработку только новых ссылок с processor из сессии
+    await start_processing(call.message, links_to_process, processor, duplicate_check, user_id, db, vk_service, bot)
+
+
 
 
 @router.callback_query(F.data == "keep_all")
@@ -192,20 +221,21 @@ async def on_keep_all(call: CallbackQuery, db, vk_service, bot):
         await call.message.edit_text(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
+    # Получаем все данные из сессии
+    all_links = session.get("all_links", [])
+    duplicate_check = session.get("duplicate_check", {})
+    processor = session.get("processor")  # Получаем processor из сессии
+
     await call.message.edit_text(
-        f"✅ Начинаю обработку всех {len(session.get('all_links', []))} ссылок\n\n"
+        f"✅ Начинаю обработку всех {len(all_links)} ссылок\n\n"
         f"<i>Данные из кеша будут использованы автоматически</i>"
     )
 
-    # Получаем данные из сессии
-    all_links = session.get("all_links", [])
-    duplicate_check = session.get("duplicate_check", {})
-
-    # Запускаем обработку всех ссылок
+    # Запускаем обработку всех ссылок с processor
     await start_processing(
         call.message,
         all_links,
-        None,  # processor не нужен для прямых ссылок
+        processor,  # Передаем processor из сессии
         duplicate_check,
         user_id,
         db,
@@ -230,6 +260,7 @@ async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
         return
 
     duplicate_check = session.get("duplicate_check", {})
+    processor = session.get("processor")  # Получаем processor из сессии
 
     # Будем перепроверять только дубликаты без данных
     links_to_update = duplicate_check.get("duplicates_no_data", [])
@@ -246,8 +277,8 @@ async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
         f"🔄 Обновляю данные для {len(links_to_update)} ссылок без результатов"
     )
 
-    # Запускаем обработку
-    await start_processing(call.message, links_to_update, None, duplicate_check, user_id, db, vk_service, bot)
+    # Запускаем обработку с processor из сессии
+    await start_processing(call.message, links_to_update, processor, duplicate_check, user_id, db, vk_service, bot)
 
 
 @router.callback_query(F.data == "cancel_processing")

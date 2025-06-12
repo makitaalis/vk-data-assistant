@@ -1,11 +1,12 @@
 """Функции для экспорта результатов в различные форматы"""
+import json
 
 import pandas as pd
 import tempfile
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 from bot.config import EXPORT_DATE_FORMAT, EXPORT_COLUMN_WIDTHS
 from bot.utils.messages import MESSAGES
@@ -19,13 +20,6 @@ async def create_excel_from_results(
 ) -> List[Tuple[Path, str]]:
     """
     Создает Excel файл из результатов поиска
-
-    Args:
-        all_results: Словарь с результатами {link: {phones, full_name, birth_date}}
-        links_order: Порядок ссылок для сохранения
-
-    Returns:
-        Список кортежей (путь_к_файлу, описание)
     """
     temp_dir = Path(tempfile.mkdtemp())
     ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
@@ -34,63 +28,64 @@ async def create_excel_from_results(
     files_to_return = []
 
     try:
+        # Получаем процессор из сессии для доступа к исходному файлу
+        from bot.utils.session_manager import get_user_session
+        import asyncio
+
+        # Получаем ID пользователя из контекста
+        # Это временное решение - нужно передавать user_id в функцию
+        session = None
+        processor = None
+
+        # Если есть исходный файл, используем его структуру
+        if hasattr(asyncio, '_current_task'):
+            # Попытка получить данные из текущего контекста
+            # В реальности нужно передавать processor в функцию
+            pass
+
         # Подготавливаем данные для DataFrame
         data_for_df = []
 
+        # Определяем максимальное количество телефонов
+        max_phones = 0
+        for result_data in all_results.values():
+            phones = result_data.get("phones", [])
+            if isinstance(phones, list):
+                max_phones = max(max_phones, len(phones))
+
+        # Создаем данные для каждой ссылки
         for link in links_order:
             result_data = all_results.get(link, {})
 
-            # Извлекаем данные с проверкой типов
+            # Извлекаем телефоны
             phones = result_data.get("phones", [])
-
-            # Обработка phones - убедимся что это список
             if phones is None:
                 phones = []
             elif isinstance(phones, str):
-                # Если строка, пробуем распарсить JSON
                 if phones.startswith('['):
                     try:
                         phones = json.loads(phones)
                     except:
                         phones = []
                 else:
-                    # Если просто строка с номером
                     phones = [phones] if phones else []
             elif not isinstance(phones, list):
                 phones = []
 
-            # Убедимся что элементы списка - строки
             phones = [str(p) for p in phones if p]
 
-            full_name = result_data.get("full_name", "")
-            birth_date = result_data.get("birth_date", "")
+            # Создаем строку с ссылкой и телефонами
+            row_data = {"Ссылка VK": link}
 
-            # Преобразуем в строки, обрабатывая None
-            full_name = str(full_name) if full_name is not None else ""
-            birth_date = str(birth_date) if birth_date is not None else ""
-
-            # Создаем словарь для строки
-            row_data = {
-                "Ссылка VK": link,
-                "Телефон 1": phones[0] if len(phones) > 0 else "",
-                "Телефон 2": phones[1] if len(phones) > 1 else "",
-                "Телефон 3": phones[2] if len(phones) > 2 else "",
-                "Телефон 4": phones[3] if len(phones) > 3 else "",
-                "Полное имя": full_name,
-                "Дата рождения": birth_date
-            }
+            # Добавляем телефоны в отдельные столбцы
+            for i in range(max_phones):
+                col_name = f"Телефон{i + 1}"
+                row_data[col_name] = phones[i] if i < len(phones) else ""
 
             data_for_df.append(row_data)
 
-        # Создаем DataFrame из списка словарей
+        # Создаем DataFrame
         df = pd.DataFrame(data_for_df)
-
-        # Если DataFrame пустой, создаем с правильными колонками
-        if len(df) == 0:
-            df = pd.DataFrame(columns=[
-                "Ссылка VK", "Телефон 1", "Телефон 2", "Телефон 3",
-                "Телефон 4", "Полное имя", "Дата рождения"
-            ])
 
         # Сохраняем в Excel
         with pd.ExcelWriter(path_result, engine='openpyxl') as writer:
@@ -98,44 +93,20 @@ async def create_excel_from_results(
 
             # Автоподбор ширины столбцов
             worksheet = writer.sheets['Результаты']
-
-            # Устанавливаем предопределенные ширины
             for column in worksheet.columns:
                 column_letter = column[0].column_letter
-                column_title = column[0].value
+                column_title = str(column[0].value)
 
-                if column_title in EXPORT_COLUMN_WIDTHS:
-                    worksheet.column_dimensions[column_letter].width = EXPORT_COLUMN_WIDTHS[column_title]
-                else:
-                    # Автоподбор для остальных колонок
-                    max_length = 0
-                    for cell in column:
-                        try:
-                            if cell.value and len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except Exception:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    if adjusted_width > 0:
-                        worksheet.column_dimensions[column_letter].width = adjusted_width
+                if column_title == "Ссылка VK":
+                    worksheet.column_dimensions[column_letter].width = 50
+                elif column_title.startswith("Телефон"):
+                    worksheet.column_dimensions[column_letter].width = 15
 
         logger.info(f"✅ Сохранен файл с данными: {path_result}")
 
-        # Правильный подсчет статистики
-        found_count = 0
-        not_found_count = 0
-
-        for link in links_order:
-            data = all_results.get(link, {})
-            # Проверяем есть ли хоть какие-то данные
-            has_phones = bool(data.get("phones", []))
-            has_name = bool(data.get("full_name", ""))
-            has_birth = bool(data.get("birth_date", ""))
-
-            if has_phones or has_name or has_birth:
-                found_count += 1
-            else:
-                not_found_count += 1
+        # Подсчет статистики
+        found_count = sum(1 for data in all_results.values() if data.get("phones"))
+        not_found_count = len(links_order) - found_count
 
         caption = MESSAGES["file_ready"].format(
             total=len(links_order),
@@ -144,62 +115,6 @@ async def create_excel_from_results(
         )
 
         files_to_return.append((path_result, caption))
-
-        # Если есть результаты, создаем также файл только с найденными данными
-        if found_count > 0:
-            path_found_only = temp_dir / f"vk_data_found_only_{ts}.xlsx"
-
-            # Фильтруем только записи с данными
-            found_data = []
-            for link in links_order:
-                data = all_results.get(link, {})
-                if data.get("phones") or data.get("full_name") or data.get("birth_date"):
-                    phones = data.get("phones", [])
-
-                    # Обработка phones
-                    if phones is None:
-                        phones = []
-                    elif isinstance(phones, str):
-                        if phones.startswith('['):
-                            try:
-                                phones = json.loads(phones)
-                            except:
-                                phones = []
-                        else:
-                            phones = [phones] if phones else []
-                    elif not isinstance(phones, list):
-                        phones = []
-
-                    phones = [str(p) for p in phones if p]
-
-                    row_data = {
-                        "Ссылка VK": link,
-                        "Телефон 1": phones[0] if len(phones) > 0 else "",
-                        "Телефон 2": phones[1] if len(phones) > 1 else "",
-                        "Телефон 3": phones[2] if len(phones) > 2 else "",
-                        "Телефон 4": phones[3] if len(phones) > 3 else "",
-                        "Полное имя": data.get("full_name", ""),
-                        "Дата рождения": data.get("birth_date", "")
-                    }
-                    found_data.append(row_data)
-
-            df_found = pd.DataFrame(found_data)
-
-            # Сохраняем файл только с найденными
-            with pd.ExcelWriter(path_found_only, engine='openpyxl') as writer:
-                df_found.to_excel(writer, index=False, sheet_name='Найденные данные')
-
-                # Форматирование
-                worksheet = writer.sheets['Найденные данные']
-                for column in worksheet.columns:
-                    column_letter = column[0].column_letter
-                    column_title = column[0].value
-
-                    if column_title in EXPORT_COLUMN_WIDTHS:
-                        worksheet.column_dimensions[column_letter].width = EXPORT_COLUMN_WIDTHS[column_title]
-
-            caption_found = f"📋 Файл только с найденными данными ({found_count} записей)"
-            files_to_return.append((path_found_only, caption_found))
 
     except Exception as e:
         logger.error(f"Ошибка при создании Excel файла: {e}")
@@ -283,3 +198,53 @@ async def export_statistics_report(stats: Dict[str, Any]) -> Path:
     except Exception as e:
         logger.error(f"Ошибка при экспорте статистики: {e}")
         raise
+
+
+# В bot/utils/export.py добавьте новую функцию
+async def create_excel_with_original_data(
+        all_results: Dict[str, Dict[str, Any]],
+        links_order: List[str],
+        processor: Optional['ExcelProcessor'] = None
+) -> List[Tuple[Path, str]]:
+    """
+    Создает Excel файл с исходными данными и добавленными телефонами
+    """
+    temp_dir = Path(tempfile.mkdtemp())
+    ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
+    files_to_return = []
+
+    try:
+        # Если есть процессор с исходным файлом
+        if processor and processor.original_df is not None:
+            path_result = temp_dir / f"vk_data_complete_{ts}.xlsx"
+
+            # Используем метод процессора для сохранения с исходными данными
+            success = processor.save_results_with_original_data(
+                all_results,
+                path_result
+            )
+
+            if success:
+                # Подсчет статистики
+                found_count = sum(1 for data in all_results.values() if data.get("phones"))
+                not_found_count = len(links_order) - found_count
+
+                caption = f"""📊 Файл с результатами готов!
+
+✅ Обработано: {len(links_order)} ссылок
+📱 Найдены телефоны: {found_count}
+❌ Без телефонов: {not_found_count}
+
+💾 Все исходные данные сохранены!"""
+
+                files_to_return.append((path_result, caption))
+        else:
+            # Если нет исходного файла, используем старый метод
+            return await create_excel_from_results(all_results, links_order)
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании Excel файла: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+    return files_to_return

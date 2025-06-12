@@ -2,7 +2,6 @@
 
 import logging
 import tempfile
-# Также убедитесь, что есть эти импорты:
 from pathlib import Path
 
 import pandas as pd
@@ -21,9 +20,9 @@ from bot.keyboards.inline import (
 from bot.utils.messages import MESSAGES
 from bot.utils.session_manager import (
     get_user_session,
-    clear_user_session
+    clear_user_session,
+    save_user_session
 )
-from bot.utils.session_manager import save_user_session
 from db_loader import DatabaseLoader
 from db_module import VKDatabase
 from services.analysis_service import FileAnalyzer
@@ -42,7 +41,7 @@ async def on_document(msg: Message, db: VKDatabase, bot):
     session = await get_user_session(user_id)
 
     # Если включен режим загрузки БД
-    if session.get("db_load_mode"):
+    if session and session.get("db_load_mode"):
         # Проверка прав администратора
         if user_id not in ADMIN_IDS:
             await msg.answer(MESSAGES["error_no_access"])
@@ -272,7 +271,7 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
     if not await check_balance_before_processing(call.message, len(links), vk_service):
         return
 
-    # Сохраняем информацию в сессию
+    # Сохраняем информацию в сессию с processor
     session_data = {
         "links": links,
         "links_order": links,
@@ -280,7 +279,8 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         "all_links": links,
         "temp_file": session.get('temp_file'),
         "file_name": session.get('file_name'),
-        "processor": processor  # Сохраняем для последующего использования
+        "processor": processor,  # Важно: сохраняем processor
+        "file_mode": "processing"
     }
     await save_user_session(user_id, session_data)
 
@@ -344,14 +344,22 @@ async def on_process_after_analysis(call: CallbackQuery, db: VKDatabase, vk_serv
 
     # Используем ExcelProcessor
     processor = ExcelProcessor()
-    processor.load_excel_file(file_path)
+    links, row_indices, success = processor.load_excel_file(file_path)
 
-    # Обновляем сессию
+    if not success:
+        await call.message.edit_text(
+            "❌ Ошибка при загрузке файла",
+            reply_markup=main_menu_kb(user_id, ADMIN_IDS)
+        )
+        return
+
+    # Обновляем сессию с processor
     session["links"] = vk_links
     session["links_order"] = vk_links
     session["results"] = {}
-    session["processor"] = processor
+    session["processor"] = processor  # Важно: сохраняем processor
     session["all_links"] = vk_links
+    session["file_mode"] = "processing"
     await save_user_session(user_id, session)
 
     # Используем информацию о дубликатах из анализа
