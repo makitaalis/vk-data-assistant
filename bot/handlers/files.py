@@ -271,6 +271,17 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
     if not await check_balance_before_processing(call.message, len(links), vk_service):
         return
 
+    # НОВОЕ: Извлекаем телефоны из файла для проверки дубликатов
+    from db_loader import DatabaseLoader
+    loader = DatabaseLoader(db)
+    records, _ = loader.process_excel_file(file_path)
+
+    # Создаем карту телефонов для каждой VK ссылки
+    phones_map = {}
+    for record in records:
+        if not record["link"].startswith("phone:"):
+            phones_map[record["link"]] = record.get("phones", [])
+
     # Сохраняем информацию в сессию с processor
     session_data = {
         "links": links,
@@ -280,26 +291,44 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         "temp_file": session.get('temp_file'),
         "file_name": session.get('file_name'),
         "processor": processor,  # Важно: сохраняем processor
-        "file_mode": "processing"
+        "file_mode": "processing",
+        "phones_map": phones_map  # НОВОЕ: сохраняем карту телефонов
     }
     await save_user_session(user_id, session_data)
 
-    # Проверяем дубликаты
-    duplicate_check = await db.check_duplicates_extended(links)
+    # Проверяем дубликаты с учетом телефонов
+    duplicate_check = await db.check_duplicates_extended(links, phones_map)
 
     # Если есть дубликаты, показываем анализ
     total = len(links)
-    duplicate_count = len(duplicate_check["duplicates_with_data"]) + len(duplicate_check["duplicates_no_data"])
+    stats = duplicate_check["stats"]
 
-    if duplicate_count > 0:
-        analysis_text = MESSAGES["duplicate_analysis"].format(
-            filename=session.get('file_name', 'файл'),
-            total=total,
-            new_count=len(duplicate_check["new"]),
-            duplicate_count=duplicate_count,
-            with_data_count=len(duplicate_check["duplicates_with_data"]),
-            no_data_count=len(duplicate_check["duplicates_no_data"])
-        )
+    # Считаем общее количество дубликатов
+    total_duplicates = stats["duplicate_by_vk"] + stats["duplicate_by_phone"] + stats["duplicate_by_both"]
+
+    if total_duplicates > 0:
+        # Подсчитываем дубликаты с данными
+        with_data_count = len(duplicate_check["duplicates_with_data"])
+        no_data_count = len(duplicate_check["duplicates_no_data"])
+
+        analysis_text = f"""📊 <b>Анализ файла завершен!</b>
+
+📁 Файл: <code>{session.get('file_name', 'файл')}</code>
+
+<b>📊 Статистика VK ссылок:</b>
+- Всего: {total}
+- Новых: {stats['new']}
+- Дубликатов по VK: {stats['duplicate_by_vk'] + stats['duplicate_by_both']}
+
+<b>📱 Статистика телефонов:</b>
+- Дубликатов по телефонам: {stats['duplicate_by_phone'] + stats['duplicate_by_both']}
+
+<b>📋 Итого дубликатов: {total_duplicates}</b>
+- С данными: {with_data_count}
+- Без данных: {no_data_count + len(duplicate_check.get('duplicate_phones', {}))}
+
+<b>Что делать с дубликатами?</b>"""
+
         await call.message.edit_text(analysis_text, reply_markup=duplicate_actions_kb())
 
         # Сохраняем duplicate_check

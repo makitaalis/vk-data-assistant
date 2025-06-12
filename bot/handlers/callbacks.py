@@ -184,13 +184,18 @@ async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
     duplicate_check = session.get("duplicate_check", {})
     processor = session.get("processor")  # Получаем processor из сессии
 
-    # Оставляем только новые ссылки
+    # Оставляем только новые ссылки (исключаем все типы дубликатов)
     links_to_process = duplicate_check.get("new", [])
 
     if not links_to_process:
+        stats = duplicate_check.get("stats", {})
         await call.message.edit_text(
-            "ℹ️ Все ссылки уже были проверены ранее.\n"
-            "Нет новых ссылок для обработки.",
+            f"ℹ️ Все ссылки являются дубликатами.\n\n"
+            f"📊 Статистика:\n"
+            f"- Дубликатов по VK: {stats.get('duplicate_by_vk', 0)}\n"
+            f"- Дубликатов по телефонам: {stats.get('duplicate_by_phone', 0)}\n"
+            f"- Дубликатов по обоим: {stats.get('duplicate_by_both', 0)}\n\n"
+            f"Нет новых ссылок для обработки.",
             reply_markup=main_menu_kb(user_id, ADMIN_IDS)
         )
         return
@@ -226,8 +231,13 @@ async def on_keep_all(call: CallbackQuery, db, vk_service, bot):
     duplicate_check = session.get("duplicate_check", {})
     processor = session.get("processor")  # Получаем processor из сессии
 
+    # Получаем статистику для отображения
+    stats = duplicate_check.get("stats", {})
+    total_duplicates = stats.get("duplicate_by_vk", 0) + stats.get("duplicate_by_phone", 0) + stats.get("duplicate_by_both", 0)
+
     await call.message.edit_text(
         f"✅ Начинаю обработку всех {len(all_links)} ссылок\n\n"
+        f"<i>Из них дубликатов: {total_duplicates}</i>\n"
         f"<i>Данные из кеша будут использованы автоматически</i>"
     )
 
@@ -262,13 +272,17 @@ async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
     duplicate_check = session.get("duplicate_check", {})
     processor = session.get("processor")  # Получаем processor из сессии
 
-    # Будем перепроверять только дубликаты без данных
+    # Будем перепроверять только дубликаты без данных (исключаем дубликаты по телефонам)
     links_to_update = duplicate_check.get("duplicates_no_data", [])
+
+    # Исключаем ссылки которые являются дубликатами по телефонам
+    phone_duplicates = set(duplicate_check.get("duplicate_phones", {}).keys())
+    links_to_update = [link for link in links_to_update if link not in phone_duplicates]
 
     if not links_to_update:
         await call.message.edit_text(
             "ℹ️ Нет дубликатов для обновления.\n"
-            "Все существующие дубликаты уже имеют данные.",
+            "Все существующие дубликаты уже имеют данные или являются дубликатами по телефонам.",
             reply_markup=main_menu_kb(user_id, ADMIN_IDS)
         )
         return

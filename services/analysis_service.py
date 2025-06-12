@@ -36,19 +36,35 @@ class FileAnalyzer:
         for r in records:
             all_phones.update(r.get('phones', []))
 
+        # Создаем карту телефонов для каждой VK ссылки
+        phones_map = {}
+        for record in records:
+            if not record['link'].startswith('phone:'):
+                phones_map[record['link']] = record.get('phones', [])
+
         # Проверка дубликатов
         duplicate_vk = {}
         duplicate_phones = {}
 
         if self.db:
-            duplicate_vk = await self.db.check_duplicates_extended(all_vk_links) if all_vk_links else {
+            # Используем обновленный метод check_duplicates_extended с картой телефонов
+            duplicate_vk = await self.db.check_duplicates_extended(all_vk_links, phones_map) if all_vk_links else {
                 "new": [],
                 "duplicates_with_data": {},
-                "duplicates_no_data": []
+                "duplicates_no_data": [],
+                "duplicate_phones": {},
+                "stats": {
+                    "total": 0,
+                    "duplicate_by_vk": 0,
+                    "duplicate_by_phone": 0,
+                    "duplicate_by_both": 0,
+                    "new": 0
+                }
             }
+            # Этот вызов остается для детальной информации о телефонах
             duplicate_phones = await self.db.check_phone_duplicates(list(all_phones)) if all_phones else {}
 
-        # Генерация рекомендаций
+        # Генерация рекомендаций с учетом новой статистики
         recommendations = self.generate_recommendations(stats, network, duplicate_vk, duplicate_phones)
 
         return {
@@ -106,11 +122,13 @@ class FileAnalyzer:
         network = analysis['network']['stats']
         duplicates = analysis['duplicates']
 
+        # Получаем статистику из нового формата
+        vk_stats = duplicates['vk'].get('stats', {})
+
         # Подсчет дубликатов
-        duplicate_vk_count = len(duplicates['vk'].get('duplicates_with_data', {})) + len(
-            duplicates['vk'].get('duplicates_no_data', []))
+        duplicate_vk_count = vk_stats.get('duplicate_by_vk', 0) + vk_stats.get('duplicate_by_both', 0)
+        duplicate_phones_count = vk_stats.get('duplicate_by_phone', 0) + vk_stats.get('duplicate_by_both', 0)
         duplicate_vk_with_data = len(duplicates['vk'].get('duplicates_with_data', {}))
-        duplicate_phones_count = len(duplicates['phones'])
 
         # Форматирование рекомендаций
         recommendations_text = ""

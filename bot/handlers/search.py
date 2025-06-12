@@ -189,8 +189,8 @@ async def on_text_message(msg: Message, db, vk_service, bot):
     }
     await save_user_session(user_id, session_data)
 
-    # Проверяем дубликаты
-    duplicate_check = await db.check_duplicates_extended(links)
+    # Проверяем дубликаты (для прямых ссылок не проверяем телефоны)
+    duplicate_check = await db.check_duplicates_extended(links, None)
 
     # Показываем анализ дубликатов
     total = len(links)
@@ -240,6 +240,22 @@ async def start_processing(
     links_count = len(links_to_process)
     if not await check_balance_before_processing(message, links_count, vk_service):
         return  # Прерываем если недостаточно поисков
+
+    # НОВОЕ: Фильтруем ссылки с учетом дубликатов по телефонам
+    actual_links_to_process = []
+    skipped_phone_duplicates = []
+
+    if duplicate_check and "duplicate_phones" in duplicate_check:
+        for link in links_to_process:
+            if link in duplicate_check["duplicate_phones"]:
+                skipped_phone_duplicates.append(link)
+            else:
+                actual_links_to_process.append(link)
+    else:
+        actual_links_to_process = links_to_process
+
+    # Обновляем количество для проверки
+    links_to_process = actual_links_to_process
 
     # Получаем закешированные результаты
     cached_results = await db.get_cached_results(links_to_process)

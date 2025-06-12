@@ -173,9 +173,14 @@ class VKDatabase:
                 EXECUTE FUNCTION update_updated_at_column();
             """)
 
-    async def check_duplicates_extended(self, links: List[str]) -> Dict[str, Any]:
+    async def check_duplicates_extended(self, links: List[str], phones_map: Dict[str, List[str]] = None) -> Dict[
+        str, Any]:
         """
-        Проверяет список ссылок на наличие в базе
+        Проверяет список ссылок на наличие в базе по VK ссылкам И телефонам
+
+        Args:
+            links: Список VK ссылок для проверки
+            phones_map: Словарь {vk_link: [phones]} - телефоны для каждой ссылки (опционально)
 
         Возвращает словарь:
         {
@@ -183,17 +188,40 @@ class VKDatabase:
             "duplicates_with_data": {  # Дубликаты с найденными данными
                 "link3": {"phones": [...], "full_name": "...", ...}
             },
-            "duplicates_no_data": ["link4", "link5"]  # Дубликаты без данных
+            "duplicates_no_data": ["link4", "link5"],  # Дубликаты без данных
+            "duplicate_phones": {  # Дубликаты по телефонам
+                "link6": ["79001234567", "79002345678"]  # ссылка и найденные телефоны
+            },
+            "stats": {  # Статистика дубликатов
+                "total": 100,
+                "duplicate_by_vk": 50,
+                "duplicate_by_phone": 20,
+                "duplicate_by_both": 10,
+                "new": 20
+            }
         }
         """
         result = {
             "new": [],
             "duplicates_with_data": {},
-            "duplicates_no_data": []
+            "duplicates_no_data": [],
+            "duplicate_phones": {},
+            "stats": {
+                "total": len(links),
+                "duplicate_by_vk": 0,
+                "duplicate_by_phone": 0,
+                "duplicate_by_both": 0,
+                "new": 0
+            }
         }
 
         if not links:
             return result
+
+        if phones_map is not None and not isinstance(phones_map, dict):
+            logger.error("phones_map должен быть словарем")
+            phones_map = None
+
 
         async with self.acquire() as conn:
             # Получаем все существующие ссылки одним запросом
@@ -225,18 +253,64 @@ class VKDatabase:
                 }
                 existing_links[row["link"]] = link_data
 
-        # Классифицируем ссылки
+            # Если предоставлены телефоны, проверяем их в базе
+            duplicate_phones_map = {}
+            if phones_map:
+                # Собираем все уникальные телефоны для batch проверки
+                all_phones_to_check = []
+                for link, phones in phones_map.items():
+                    if phones and link not in existing_links:  # Проверяем телефоны только для НЕ дубликатов по VK
+                        all_phones_to_check.extend(phones)
+
+                if all_phones_to_check:
+                    # Проверяем какие телефоны уже есть в базе
+                    phone_rows = await conn.fetch("""
+                        SELECT DISTINCT phone 
+                        FROM phone_links 
+                        WHERE phone = ANY($1::text[])
+                    """, list(set(all_phones_to_check)))
+
+                    existing_phones = {row["phone"] for row in phone_rows}
+
+                    # Помечаем ссылки с дубликатами телефонов
+                    for link, phones in phones_map.items():
+                        if link not in existing_links and phones:  # Только для не-VK дубликатов
+                            found_phones = [p for p in phones if p in existing_phones]
+                            if found_phones:
+                                duplicate_phones_map[link] = found_phones
+
+        # Классифицируем ссылки с учетом дубликатов по телефонам
         for link in links:
-            if link not in existing_links:
-                result["new"].append(link)
-            else:
+            is_vk_duplicate = link in existing_links
+            is_phone_duplicate = link in duplicate_phones_map
+
+            if is_vk_duplicate and is_phone_duplicate:
+                # Дубликат и по VK и по телефону
                 data = existing_links[link]
                 if data["found_data"]:
                     result["duplicates_with_data"][link] = data
                 else:
                     result["duplicates_no_data"].append(link)
+                result["stats"]["duplicate_by_both"] += 1
+            elif is_vk_duplicate:
+                # Только дубликат по VK
+                data = existing_links[link]
+                if data["found_data"]:
+                    result["duplicates_with_data"][link] = data
+                else:
+                    result["duplicates_no_data"].append(link)
+                result["stats"]["duplicate_by_vk"] += 1
+            elif is_phone_duplicate:
+                # Только дубликат по телефону
+                result["duplicate_phones"][link] = duplicate_phones_map[link]
+                result["stats"]["duplicate_by_phone"] += 1
+            else:
+                # Новая ссылка
+                result["new"].append(link)
+                result["stats"]["new"] += 1
 
         return result
+
 
     async def check_phone_duplicates(self, phones: List[str]) -> Dict[str, List[Dict[str, str]]]:
         """
