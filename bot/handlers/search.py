@@ -1,4 +1,4 @@
-"""Обработчики поиска по ссылкам и телефонам"""
+"""Обработчики поиска по ссылкам и телефонам - оптимизированная версия"""
 
 import asyncio
 import logging
@@ -390,8 +390,36 @@ async def start_processing(
 
         await status.edit_text(limit_message, reply_markup=continue_kb())
 
-    # Запускаем обработку
-    await vk_service.process_queue(queue, result_cb, limit_cb)
+    # НОВОЕ: Выбираем метод обработки в зависимости от настроек и количества ссылок
+    from bot.config import (
+        VK_BATCH_PROCESSING_ENABLED,
+        VK_MIN_LINKS_FOR_BATCH,
+        VK_BATCH_SIZE,
+        VK_BATCH_DELAY,
+        VK_INTER_BATCH_DELAY,
+        VK_BATCH_TIMEOUT
+    )
+
+    # Решаем, использовать ли пакетную обработку
+    use_batch = (
+        VK_BATCH_PROCESSING_ENABLED and
+        len(links_to_check) >= VK_MIN_LINKS_FOR_BATCH
+    )
+
+    if use_batch:
+        logger.info(f"🚀 Используем пакетную обработку для {len(links_to_check)} ссылок")
+        await vk_service.process_queue_batch(
+            queue,
+            result_cb,
+            limit_cb,
+            batch_size=VK_BATCH_SIZE,
+            batch_delay=VK_BATCH_DELAY,
+            inter_batch_delay=VK_INTER_BATCH_DELAY,
+            batch_timeout=VK_BATCH_TIMEOUT
+        )
+    else:
+        logger.info(f"📝 Используем обычную обработку для {len(links_to_check)} ссылок")
+        await vk_service.process_queue(queue, result_cb, limit_cb)
 
     # Обработка завершена успешно
     await finish_processing(message, all_results, processor, links_to_process, user_id, db, bot)

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Dict, Any, Optional, Callable, Coroutine
+from typing import Dict, Any, Optional, Callable, Coroutine, List
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetHistoryRequest
@@ -33,11 +33,16 @@ class VKService:
         self.bot_entity = None
         self.is_initialized = False
 
-        # Для отслеживания текущего поиска
+        # Для отслеживания текущего поиска (старый метод)
         self.current_link = None
         self.result_event = asyncio.Event()
         self.current_result = None
         self.search_message_id = None
+
+        # НОВОЕ: Для пакетной обработки
+        self.sent_messages = {}  # {msg_id: {"link": link, "time": time}}
+        self.results_queue = asyncio.Queue()  # Очередь готовых результатов
+        self.batch_mode = False  # Флаг режима работы
 
         # Счетчики
         self.processed_count = 0
@@ -75,17 +80,260 @@ class VKService:
             if not event.message or not event.message.text:
                 return
 
-            await self._process_message(event.message.text, event.message.id)
+            # НОВОЕ: Обработка в зависимости от режима
+            if self.batch_mode:
+                await self._process_message_batch_mode(event.message)
+            else:
+                await self._process_message(event.message.text, event.message.id)
 
         @self.client.on(events.MessageEdited(from_users=self.bot_entity))
         async def handle_edited_message(event):
             if not event.message or not event.message.text:
                 return
 
-            await self._process_message(event.message.text, event.message.id)
+            # НОВОЕ: Обработка в зависимости от режима
+            if self.batch_mode:
+                await self._process_message_batch_mode(event.message)
+            else:
+                await self._process_message(event.message.text, event.message.id)
+
+    # НОВЫЙ МЕТОД: Обработка сообщений в пакетном режиме
+    async def _process_message_batch_mode(self, message):
+        """Обработка сообщений в пакетном режиме"""
+        text = message.text
+
+        # Проверяем, это ответ на наше сообщение?
+        if message.reply_to_msg_id and message.reply_to_msg_id in self.sent_messages:
+            # Это ответ на нашу ссылку!
+            request_info = self.sent_messages[message.reply_to_msg_id]
+            link = request_info["link"]
+
+            # Проверка на лимит
+            if any(phrase in text for phrase in ["Лимит запросов исчерпан", "Too many requests", "limit"]):
+                logger.error(f"⚠️ Достигнут лимит запросов для {link}!")
+                result = {"link": link, "error": "limit_reached", "phones": [], "full_name": "", "birth_date": ""}
+                await self.results_queue.put(result)
+                del self.sent_messages[message.reply_to_msg_id]
+                return
+
+            # Проверка на результат
+            if self._is_result_message(text):
+                result = self._parse_result(text)
+                result["link"] = link
+                result["response_time"] = time.time() - request_info["time"]
+
+                # Добавляем в очередь результатов
+                await self.results_queue.put(result)
+
+                # Удаляем из ожидающих
+                del self.sent_messages[message.reply_to_msg_id]
+
+                logger.info(f"✅ Получен результат для {link} (время ответа: {result['response_time']:.1f}с)")
+            elif any(phrase in text for phrase in ["не найден", "ошибка", "error", "Попробуйте позже"]):
+                # Ошибка поиска
+                result = {"link": link, "phones": [], "full_name": "", "birth_date": "", "error": "not_found"}
+                await self.results_queue.put(result)
+                del self.sent_messages[message.reply_to_msg_id]
+                logger.warning(f"⚠️ Бот вернул ошибку для {link}")
+
+    # НОВЫЙ МЕТОД: Отправка пакета ссылок
+    async def send_link_batch(self, links: List[str], batch_delay: float = 0.3) -> List[int]:
+        """Отправляет пакет ссылок и запоминает их ID"""
+        sent_ids = []
+
+        for i, link in enumerate(links):
+            try:
+                msg = await self.client.send_message(self.bot_entity, link)
+
+                # Сохраняем mapping
+                self.sent_messages[msg.id] = {
+                    "link": link,
+                    "time": time.time()
+                }
+                sent_ids.append(msg.id)
+
+                logger.info(f"📤 [{i + 1}/{len(links)}] Отправлена ссылка: {link} (msg_id={msg.id})")
+
+                # Небольшая задержка между отправками (кроме последней)
+                if i < len(links) - 1:
+                    await asyncio.sleep(batch_delay)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка при отправке {link}: {e}")
+
+        return sent_ids
+
+    # НОВЫЙ МЕТОД: Ожидание результатов пакета
+    async def wait_for_batch_results(self, batch_links: List[str], timeout: float = 20.0) -> Dict[str, Dict]:
+        """Ждет результаты для пакета запросов"""
+        start_time = time.time()
+        results = {}
+        expected_count = len(batch_links)
+
+        logger.info(f"⏳ Ожидание {expected_count} результатов (таймаут: {timeout}с)...")
+
+        while len(results) < expected_count and (time.time() - start_time) < timeout:
+            try:
+                # Пытаемся получить результат из очереди
+                result = await asyncio.wait_for(self.results_queue.get(), timeout=0.5)
+
+                link = result.get("link")
+                if link and link in batch_links:
+                    results[link] = result
+                    logger.info(f"📊 Получен результат {len(results)}/{expected_count} для {link}")
+
+            except asyncio.TimeoutError:
+                # Проверяем, не слишком ли долго ждем
+                elapsed = time.time() - start_time
+                if elapsed > timeout * 0.8:  # 80% времени прошло
+                    logger.warning(f"⏰ Приближается таймаут, получено {len(results)}/{expected_count}")
+                continue
+
+        # Обрабатываем таймауты для недополученных результатов
+        for link in batch_links:
+            if link not in results:
+                logger.warning(f"⏱ Таймаут для {link}")
+                results[link] = {
+                    "link": link,
+                    "phones": [],
+                    "full_name": "",
+                    "birth_date": "",
+                    "error": "timeout"
+                }
+
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Пакет обработан за {elapsed:.1f}с, получено {len(results)} результатов")
+
+        return results
+
+    # НОВЫЙ МЕТОД: Пакетная обработка очереди
+    async def process_queue_batch(
+            self,
+            queue: asyncio.Queue,
+            result_callback: Callable[[str, Dict[str, Any]], Coroutine],
+            limit_callback: Callable[[], Coroutine],
+            batch_size: int = 3,
+            batch_delay: float = 0.3,
+            inter_batch_delay: float = 1.0,
+            batch_timeout: float = 20.0
+    ):
+        """Обработка очереди пакетами"""
+        # Включаем пакетный режим
+        self.batch_mode = True
+
+        total = queue.qsize()
+        processed = 0
+        start_time = time.time()
+
+        logger.info(f"🚀 Начинаю пакетную обработку {total} ссылок (пакеты по {batch_size})")
+
+        try:
+            while not queue.empty():
+                # НОВОЕ: Проверяем паузу для проверки баланса
+                from bot.handlers.balance import is_processing_paused
+                while is_processing_paused():
+                    logger.debug("⏸ Обработка приостановлена для проверки баланса")
+                    await asyncio.sleep(0.5)
+
+                # Собираем пакет
+                batch = []
+                for _ in range(min(batch_size, queue.qsize())):
+                    if not queue.empty():
+                        batch.append(await queue.get())
+
+                if not batch:
+                    break
+
+                logger.info(
+                    f"📦 Обработка пакета {(processed // batch_size) + 1} из {(total + batch_size - 1) // batch_size} ({len(batch)} ссылок)")
+
+                try:
+                    # Отправляем пакет запросов
+                    sent_ids = await self.send_link_batch(batch, batch_delay)
+
+                    # Ждем результаты
+                    results = await self.wait_for_batch_results(batch, batch_timeout)
+
+                    # Обрабатываем результаты
+                    for link in batch:
+                        if link in results:
+                            result = results[link]
+                            # Убираем служебное поле link из результата
+                            clean_result = {k: v for k, v in result.items() if k != "link"}
+                            await result_callback(link, clean_result)
+
+                            if not result.get("error"):
+                                self.processed_count += 1
+                            else:
+                                self.error_count += 1
+                        else:
+                            # Не должно произойти, но на всякий случай
+                            await result_callback(link,
+                                                  {"phones": [], "full_name": "", "birth_date": "", "error": "unknown"})
+                            self.error_count += 1
+
+                        queue.task_done()
+                        processed += 1
+
+                    # Логирование прогресса
+                    elapsed = time.time() - start_time
+                    speed = processed / elapsed if elapsed > 0 else 0
+                    eta = (total - processed) / speed if speed > 0 else 0
+
+                    logger.info(
+                        f"📊 Прогресс: {processed}/{total} ({processed / total * 100:.1f}%) | "
+                        f"Скорость: {speed:.1f} ссылок/сек | "
+                        f"Осталось: ~{int(eta)} сек"
+                    )
+
+                    # Проверка на лимит
+                    if any(r.get("error") == "limit_reached" for r in results.values()):
+                        logger.error("⚠️ Достигнут лимит запросов!")
+                        await limit_callback()
+                        # Возвращаем необработанные ссылки в очередь
+                        while not queue.empty():
+                            item = await queue.get()
+                            await queue.put(item)
+                            queue.task_done()
+                        break
+
+                    # Пауза между пакетами
+                    if not queue.empty():
+                        logger.info(f"⏸ Пауза {inter_batch_delay}с между пакетами...")
+                        await asyncio.sleep(inter_batch_delay)
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при обработке пакета: {e}")
+                    # Помечаем все ссылки пакета как ошибочные
+                    for link in batch:
+                        await result_callback(link, {"phones": [], "full_name": "", "birth_date": "", "error": str(e)})
+                        queue.task_done()
+                        processed += 1
+                        self.error_count += 1
+
+            elapsed = time.time() - start_time
+            logger.info(
+                f"✅ Пакетная обработка завершена: {processed} ссылок за {int(elapsed)} сек "
+                f"({processed / elapsed:.1f} ссылок/сек)"
+            )
+
+        finally:
+            # Выключаем пакетный режим
+            self.batch_mode = False
+            # Очищаем неполученные результаты
+            self.sent_messages.clear()
+            # Очищаем очередь результатов
+            while not self.results_queue.empty():
+                try:
+                    await self.results_queue.get_nowait()
+                except:
+                    break
+
+    # ВСЕ ОСТАЛЬНЫЕ МЕТОДЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ
+    # (Включая старые методы для обратной совместимости)
 
     async def _process_message(self, text: str, message_id: int):
-        """Обработка сообщения от бота"""
+        """Обработка сообщения от бота (старый метод)"""
         if not text:
             return
 
@@ -306,7 +554,7 @@ class VKService:
             return None
 
     async def search_vk_link(self, link: str) -> Dict[str, Any]:
-        """Поиск данных по VK ссылке"""
+        """Поиск данных по VK ссылке (старый метод для обратной совместимости)"""
         if not self.is_initialized:
             raise RuntimeError("VKService не инициализирован")
 
@@ -390,7 +638,7 @@ class VKService:
             result_callback: Callable[[str, Dict[str, Any]], Coroutine],
             limit_callback: Callable[[], Coroutine]
     ):
-        """Обработка очереди ссылок с поддержкой паузы для проверки баланса"""
+        """Обработка очереди ссылок (старый метод для обратной совместимости)"""
         total = queue.qsize()
         processed = 0
         start_time = time.time()
