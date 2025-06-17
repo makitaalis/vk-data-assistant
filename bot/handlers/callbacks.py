@@ -24,6 +24,7 @@ from bot.utils.session_manager import (
 from bot.utils.export import create_excel_from_results, create_json_report
 from bot.handlers.search import start_processing
 from services.analysis_service import FileAnalyzer
+from services.excel_service import ExcelProcessor
 
 router = Router()
 logger = logging.getLogger("callbacks_handler")
@@ -80,7 +81,14 @@ async def on_download_results(call: CallbackQuery, bot):
 
     all_results = session.get("results", {})
     links_order = session.get("links_order", [])
-    processor = session.get("processor")  # Получаем processor из сессии
+
+    # Восстанавливаем processor из сессии если возможно
+    processor = None
+    if session.get('temp_file') and session.get('vk_column_name'):
+        file_path = Path(session['temp_file'])
+        if file_path.exists():
+            processor = ExcelProcessor()
+            processor.load_excel_file(file_path)
 
     # Генерируем файлы
     files_to_send = []
@@ -182,7 +190,14 @@ async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
         return
 
     duplicate_check = session.get("duplicate_check", {})
-    processor = session.get("processor")  # Получаем processor из сессии
+
+    # Восстанавливаем processor если нужно
+    processor = None
+    if session.get('temp_file'):
+        file_path = Path(session['temp_file'])
+        if file_path.exists():
+            processor = ExcelProcessor()
+            processor.load_excel_file(file_path)
 
     # Оставляем только новые ссылки (исключаем все типы дубликатов)
     links_to_process = duplicate_check.get("new", [])
@@ -205,10 +220,8 @@ async def on_remove_duplicates(call: CallbackQuery, db, vk_service, bot):
         f"Будет обработано: {len(links_to_process)} новых ссылок"
     )
 
-    # Запускаем обработку только новых ссылок с processor из сессии
+    # Запускаем обработку только новых ссылок
     await start_processing(call.message, links_to_process, processor, duplicate_check, user_id, db, vk_service, bot)
-
-
 
 
 @router.callback_query(F.data == "keep_all")
@@ -229,11 +242,19 @@ async def on_keep_all(call: CallbackQuery, db, vk_service, bot):
     # Получаем все данные из сессии
     all_links = session.get("all_links", [])
     duplicate_check = session.get("duplicate_check", {})
-    processor = session.get("processor")  # Получаем processor из сессии
+
+    # Восстанавливаем processor если нужно
+    processor = None
+    if session.get('temp_file'):
+        file_path = Path(session['temp_file'])
+        if file_path.exists():
+            processor = ExcelProcessor()
+            processor.load_excel_file(file_path)
 
     # Получаем статистику для отображения
     stats = duplicate_check.get("stats", {})
-    total_duplicates = stats.get("duplicate_by_vk", 0) + stats.get("duplicate_by_phone", 0) + stats.get("duplicate_by_both", 0)
+    total_duplicates = stats.get("duplicate_by_vk", 0) + stats.get("duplicate_by_phone", 0) + stats.get(
+        "duplicate_by_both", 0)
 
     await call.message.edit_text(
         f"✅ Начинаю обработку всех {len(all_links)} ссылок\n\n"
@@ -241,11 +262,11 @@ async def on_keep_all(call: CallbackQuery, db, vk_service, bot):
         f"<i>Данные из кеша будут использованы автоматически</i>"
     )
 
-    # Запускаем обработку всех ссылок с processor
+    # Запускаем обработку всех ссылок
     await start_processing(
         call.message,
         all_links,
-        processor,  # Передаем processor из сессии
+        processor,
         duplicate_check,
         user_id,
         db,
@@ -270,7 +291,14 @@ async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
         return
 
     duplicate_check = session.get("duplicate_check", {})
-    processor = session.get("processor")  # Получаем processor из сессии
+
+    # Восстанавливаем processor если нужно
+    processor = None
+    if session.get('temp_file'):
+        file_path = Path(session['temp_file'])
+        if file_path.exists():
+            processor = ExcelProcessor()
+            processor.load_excel_file(file_path)
 
     # Будем перепроверять только дубликаты без данных (исключаем дубликаты по телефонам)
     links_to_update = duplicate_check.get("duplicates_no_data", [])
@@ -291,7 +319,7 @@ async def on_update_duplicates(call: CallbackQuery, db, vk_service, bot):
         f"🔄 Обновляю данные для {len(links_to_update)} ссылок без результатов"
     )
 
-    # Запускаем обработку с processor из сессии
+    # Запускаем обработку
     await start_processing(call.message, links_to_update, processor, duplicate_check, user_id, db, vk_service, bot)
 
 
@@ -441,28 +469,3 @@ async def on_cancel(call: CallbackQuery):
         MESSAGES["operation_cancelled"],
         reply_markup=main_menu_kb(user_id, ADMIN_IDS)
     )
-
-# Добавьте эти обработчики в bot/handlers/callbacks.py после существующих обработчиков:
-
-@router.callback_query(F.data == "process_with_duplicates")
-async def on_process_with_duplicates_callback(call: CallbackQuery, db, vk_service, bot):
-    """Обработка файла со всеми дубликатами"""
-    # Вызываем функцию из files.py
-    from bot.handlers.files import on_process_with_duplicates
-    await on_process_with_duplicates(call, db, vk_service, bot)
-
-
-@router.callback_query(F.data == "process_unique_only")
-async def on_process_unique_only_callback(call: CallbackQuery, db, vk_service, bot):
-    """Обработка только уникальных ссылок"""
-    # Вызываем функцию из files.py
-    from bot.handlers.files import on_process_unique_only
-    await on_process_unique_only(call, db, vk_service, bot)
-
-
-@router.callback_query(F.data == "show_duplicate_details")
-async def on_show_duplicate_details_callback(call: CallbackQuery):
-    """Показать детали дубликатов"""
-    # Вызываем функцию из files.py
-    from bot.handlers.files import on_show_duplicate_details
-    await on_show_duplicate_details(call)

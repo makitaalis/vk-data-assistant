@@ -7,10 +7,11 @@ from typing import Dict, Any, Optional, Callable, Coroutine, List
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetHistoryRequest
 
+from bot.config import VK_BOT_USERNAME
+
 logger = logging.getLogger("vk_service")
 
 # Константы
-VK_BOT_USERNAME = "vk_memosimo_3_bot"  # Основной бот
 MESSAGE_TIMEOUT = 15.0  # Увеличиваем таймаут
 INITIAL_DELAY = 2.0
 RETRY_DELAY = 1.0
@@ -18,6 +19,17 @@ MAX_RETRIES = 3
 
 # Паттерны для парсинга
 PHONE_PATTERN = re.compile(r'(?<!\d)7\d{10}(?!\d)')
+
+
+# Глобальный флаг для проверки паузы
+def is_processing_paused() -> bool:
+    """Проверяет, приостановлена ли обработка"""
+    # Импортируем локально для избежания циклической зависимости
+    try:
+        from bot.handlers.balance import processing_paused
+        return processing_paused
+    except:
+        return False
 
 
 class VKService:
@@ -55,7 +67,7 @@ class VKService:
             await self.client.start(phone=self.phone)
             logger.info("✅ Авторизация в Telegram завершена")
 
-            # Получаем entity бота
+            # Получаем entity бота из конфига
             self.bot_entity = await self.client.get_entity(VK_BOT_USERNAME)
 
             # Отправляем /start для инициализации
@@ -140,6 +152,12 @@ class VKService:
     async def send_link_batch(self, links: List[str], batch_delay: float = 0.3) -> List[int]:
         """Отправляет пакет ссылок и запоминает их ID"""
         sent_ids = []
+
+        # Убираем дубликаты из пакета
+        unique_links = list(dict.fromkeys(links))
+        if len(unique_links) != len(links):
+            logger.warning(f"⚠️ В пакете были дубликаты: {len(links)} -> {len(unique_links)}")
+            links = unique_links
 
         for i, link in enumerate(links):
             try:
@@ -230,7 +248,6 @@ class VKService:
         try:
             while not queue.empty():
                 # НОВОЕ: Проверяем паузу для проверки баланса
-                from bot.handlers.balance import is_processing_paused
                 while is_processing_paused():
                     logger.debug("⏸ Обработка приостановлена для проверки баланса")
                     await asyncio.sleep(0.5)
@@ -406,9 +423,15 @@ class VKService:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
                 name = match.group(1).strip()
-                name = re.sub(r'[`*]', '', name)
+                # Очищаем от Markdown форматирования
+                name = re.sub(r'\*\*([^*]+)\*\*', r'\1', name)  # **жирный**
+                name = re.sub(r'\*([^*]+)\*', r'\1', name)  # *курсив*
+                name = re.sub(r'__([^_]+)__', r'\1', name)  # __жирный__
+                name = re.sub(r'_([^_]+)_', r'\1', name)  # _курсив_
+                name = re.sub(r'[`*_~]', '', name)  # остальные символы
+
                 if name and name not in ["Не указано", "не указано", "—", "-"]:
-                    result["full_name"] = name
+                    result["full_name"] = name.strip()
                     break
 
         # Извлечение даты рождения
@@ -491,13 +514,11 @@ class VKService:
             self.result_event.clear()
             self.current_result = None
 
-            # Для vk_memosimo_3_bot нужно нажать кнопку "Мой профиль"
-            # Сначала попробуем отправить команду /start для получения меню
+            # Отправляем /start для получения меню
             await self.client.send_message(self.bot_entity, "/start")
             await asyncio.sleep(1)
 
-            # Теперь нажимаем кнопку "Мой профиль"
-            # Получаем последнее сообщение с кнопками
+            # Получаем последние сообщения
             messages = await self.client(GetHistoryRequest(
                 peer=self.bot_entity,
                 limit=5,
@@ -514,12 +535,17 @@ class VKService:
                 if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
                     for row in msg.reply_markup.rows:
                         for button in row.buttons:
+                            # Проверяем тип кнопки
                             if hasattr(button, 'text') and 'профиль' in button.text.lower():
-                                # Нажимаем на кнопку
-                                await msg.click(data=button.data)
-                                logger.info("✅ Нажата кнопка 'Мой профиль'")
-                                await asyncio.sleep(2)
-                                break
+                                # Проверяем, что это не URL кнопка
+                                if hasattr(button, 'data') and button.data:
+                                    await msg.click(data=button.data)
+                                    logger.info("✅ Нажата кнопка 'Мой профиль'")
+                                    await asyncio.sleep(2)
+                                    break
+                                elif hasattr(button, 'url'):
+                                    logger.warning("⚠️ Кнопка 'Мой профиль' - это URL кнопка, не могу нажать")
+                                    continue
 
             # Получаем обновленные сообщения после нажатия кнопки
             messages = await self.client(GetHistoryRequest(
@@ -648,10 +674,6 @@ class VKService:
         while not queue.empty():
             try:
                 # НОВОЕ: Проверяем, не приостановлена ли обработка
-                # Импортируем функцию проверки паузы
-                from bot.handlers.balance import is_processing_paused
-
-                # Ждем пока обработка приостановлена
                 while is_processing_paused():
                     logger.debug("⏸ Обработка приостановлена для проверки баланса")
                     await asyncio.sleep(0.5)

@@ -439,9 +439,18 @@ async def finish_processing(
     # Получаем сессию для проверки наличия processor
     session = await get_user_session(user_id)
 
-    # Если processor не передан, пытаемся получить из сессии
-    if not processor and session:
-        processor = session.get('processor')
+    # Если processor не передан, пытаемся восстановить из файла
+    if not processor and session and session.get('temp_file'):
+        file_path = Path(session['temp_file'])
+        if file_path.exists():
+            try:
+                processor = ExcelProcessor()
+                processor.load_excel_file(file_path)
+                # Восстанавливаем маппинг если есть
+                if session.get('vk_links_mapping'):
+                    processor.vk_links_mapping = session['vk_links_mapping']
+            except Exception as e:
+                logger.error(f"Не удалось восстановить processor: {e}")
 
     # Генерируем файлы с результатами
     files_to_send = []

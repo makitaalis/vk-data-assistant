@@ -133,7 +133,7 @@ LIMIT_PATTERNS = [
 ]
 
 # ===== VK Batch Processing Configuration =====
-VK_BATCH_PROCESSING_ENABLED = True  # Включить пакетную обработку
+VK_BATCH_PROCESSING_ENABLED = False  # Включить пакетную обработку
 VK_BATCH_SIZE = 3  # Размер пакета (количество одновременных запросов)
 VK_BATCH_DELAY = 0.1  # Задержка между запросами в пакете (секунды)
 VK_INTER_BATCH_DELAY = 1.2  # Задержка между пакетами (секунды)

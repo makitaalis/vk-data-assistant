@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 import redis.asyncio as redis
 import pickle
 import base64
+from pathlib import Path
 
 from bot.config import (
     REDIS_URL,
@@ -55,12 +56,19 @@ def serialize_session(session_data: Dict[str, Any]) -> str:
         if key in ['processor', 'analyzer']:
             continue
 
+        # Конвертируем Path в строку
+        if isinstance(value, Path):
+            clean_data[key] = str(value)
+        elif key == 'temp_file':
+            # Убедимся что temp_file - строка
+            clean_data[key] = str(value)
         # Для duplicate_check сохраняем только необходимые данные
-        if key == 'duplicate_check' and isinstance(value, dict):
+        elif key == 'duplicate_check' and isinstance(value, dict):
             clean_data[key] = {
                 'new': value.get('new', []),
                 'duplicates_with_data': list(value.get('duplicates_with_data', {}).keys()),
-                'duplicates_no_data': value.get('duplicates_no_data', [])
+                'duplicates_no_data': value.get('duplicates_no_data', []),
+                'stats': value.get('stats', {})
             }
         else:
             clean_data[key] = value
@@ -72,7 +80,8 @@ def deserialize_session(session_str: str) -> Dict[str, Any]:
     """Десериализация сессии"""
     try:
         return json.loads(session_str)
-    except:
+    except Exception as e:
+        logger.error(f"Ошибка десериализации сессии: {e}")
         return {}
 
 
@@ -104,9 +113,14 @@ async def save_user_session(user_id: int, session_data: Dict[str, Any]):
                 REDIS_SESSION_TTL,
                 serialized.encode('utf-8')
             )
+            logger.debug(f"✅ Сессия сохранена для пользователя {user_id}")
             return
         except Exception as e:
-            logger.error(f"Ошибка записи в Redis: {e}")
+            logger.error(f"❌ Ошибка записи в Redis: {e}")
+            logger.error(f"Данные сессии: {list(session_data.keys())}")
+            # Падаем на локальное хранилище
+            local_sessions[user_id] = session_data
+            return
 
     # Fallback на локальное хранилище
     local_sessions[user_id] = session_data

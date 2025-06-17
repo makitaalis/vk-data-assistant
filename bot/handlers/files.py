@@ -85,13 +85,18 @@ async def handle_excel_file(msg: Message, bot):
     file_info = processor.get_file_info()
 
     # Сохраняем информацию о файле в сессию
+    # ВАЖНО: сохраняем данные, которые можно сериализовать
     session = {
         'temp_file': str(path_in),
         'file_name': msg.document.file_name,
         'file_mode': 'pending',
-        'processor': processor,
+        'all_links': processor.all_links_found,  # Список ссылок
+        'unique_links': processor.get_links_without_duplicates(),  # Уникальные ссылки
+        'vk_links_mapping': processor.vk_links_mapping,  # Маппинг ссылок
         'duplicate_analysis': duplicate_analysis,
-        'file_info': file_info
+        'file_info': file_info,
+        'vk_column_name': processor.vk_column_name,  # Имя колонки с VK
+        'vk_column_index': processor.vk_column_index  # Индекс колонки
     }
     await save_user_session(user_id, session)
 
@@ -291,22 +296,17 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         return
 
     file_path = Path(session['temp_file'])
-    processor = session.get('processor')
 
-    if not processor:
-        # Если processor не сохранен, создаем новый
-        processor = ExcelProcessor()
-        links, row_indices, success = processor.load_excel_file(file_path)
+    # Восстанавливаем processor из файла
+    processor = ExcelProcessor()
+    links, row_indices, success = processor.load_excel_file(file_path)
 
-        if not success or not links:
-            await call.message.edit_text(
-                MESSAGES["error_no_vk_links"],
-                reply_markup=main_menu_kb(user_id, ADMIN_IDS)
-            )
-            return
-    else:
-        # Используем сохраненный processor
-        links = processor.get_links_without_duplicates()
+    if not success or not links:
+        await call.message.edit_text(
+            MESSAGES["error_no_vk_links"],
+            reply_markup=main_menu_kb(user_id, ADMIN_IDS)
+        )
+        return
 
     # НОВОЕ: Проверяем баланс перед обработкой
     from bot.handlers.balance import check_balance_before_processing
@@ -324,7 +324,7 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         if not record["link"].startswith("phone:"):
             phones_map[record["link"]] = record.get("phones", [])
 
-    # Сохраняем информацию в сессию с processor
+    # Сохраняем информацию в сессию (без processor)
     session_data = {
         "links": links,
         "links_order": links,
@@ -332,9 +332,12 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         "all_links": links,
         "temp_file": session.get('temp_file'),
         "file_name": session.get('file_name'),
-        "processor": processor,  # Важно: сохраняем processor
         "file_mode": "processing",
-        "phones_map": phones_map  # НОВОЕ: сохраняем карту телефонов
+        "phones_map": phones_map,  # НОВОЕ: сохраняем карту телефонов
+        # Сохраняем данные processor для восстановления
+        "vk_column_name": processor.vk_column_name,
+        "vk_column_index": processor.vk_column_index,
+        "vk_links_mapping": processor.vk_links_mapping
     }
     await save_user_session(user_id, session_data)
 
@@ -389,33 +392,61 @@ async def on_process_with_duplicates(call: CallbackQuery, db: VKDatabase, vk_ser
     user_id = call.from_user.id
     session = await get_user_session(user_id)
 
-    if not session or not session.get('processor'):
+    if not session or not session.get('temp_file'):
         await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    processor = session['processor']
-    all_links = processor.all_links_found  # Все ссылки включая дубликаты
-
-    # Проверяем баланс
-    from bot.handlers.balance import check_balance_before_processing
-    if not await check_balance_before_processing(call.message, len(all_links), vk_service):
+    file_path = Path(session['temp_file'])
+    if not file_path.exists():
+        await call.message.edit_text("❌ Временный файл удален", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    # Подготавливаем данные для обработки
+    processor = ExcelProcessor()
+    links, row_indices, success = processor.load_excel_file(file_path)
+
+    if not success:
+        await call.message.edit_text("❌ Ошибка при загрузке файла", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    # ИСПРАВЛЕНИЕ: НЕ используем all_links_found!
+    # Вместо этого создаем специальный список для обработки с дубликатами
+
+    # Опция 1: Обработать каждую уникальную ссылку по разу
+    unique_links = processor.get_links_without_duplicates()
+
+    # Опция 2: Если действительно нужно обработать дубликаты,
+    # создаем маппинг для правильного сохранения результатов
+    duplicate_mapping = {}  # {link: [row_indices]}
+    for idx, link in enumerate(processor.all_links_found):
+        if link not in duplicate_mapping:
+            duplicate_mapping[link] = []
+        duplicate_mapping[link].append(idx)
+
+    # Обрабатываем только уникальные
+    links_to_process = list(duplicate_mapping.keys())
+
+    await call.message.edit_text(
+        f"📤 Начинаю обработку {len(links_to_process)} уникальных ссылок\n"
+        f"(из {len(processor.all_links_found)} общих записей в файле)"
+    )
+
+    # Сохраняем маппинг в сессию для последующего использования
     session_data = {
-        "links": all_links,
-        "links_order": all_links,
+        "links": links_to_process,
+        "links_order": links_to_process,
         "results": {},
-        "all_links": all_links,
+        "all_links": links_to_process,
+        "duplicate_mapping": duplicate_mapping,  # Для правильного сохранения
         "temp_file": session.get('temp_file'),
         "file_name": session.get('file_name'),
-        "processor": processor,
-        "file_mode": "processing"
+        "file_mode": "processing",
+        "vk_column_name": processor.vk_column_name,
+        "vk_column_index": processor.vk_column_index,
+        "vk_links_mapping": processor.vk_links_mapping
     }
     await save_user_session(user_id, session_data)
 
-    await call.message.edit_text(f"📤 Начинаю обработку {len(all_links)} ссылок (включая дубликаты)...")
-    await start_processing(call.message, all_links, processor, {}, user_id, db, vk_service, bot)
+    await start_processing(call.message, links_to_process, processor, {}, user_id, db, vk_service, bot)
 
 
 @router.callback_query(F.data == "process_unique_only")
@@ -425,11 +456,25 @@ async def on_process_unique_only(call: CallbackQuery, db: VKDatabase, vk_service
     user_id = call.from_user.id
     session = await get_user_session(user_id)
 
-    if not session or not session.get('processor'):
+    # Проверяем наличие файла
+    if not session or not session.get('temp_file'):
         await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    processor = session['processor']
+    # Проверяем существование файла
+    file_path = Path(session['temp_file'])
+    if not file_path.exists():
+        await call.message.edit_text("❌ Временный файл удален", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    # Восстанавливаем processor из файла
+    processor = ExcelProcessor()
+    links, row_indices, success = processor.load_excel_file(file_path)
+
+    if not success:
+        await call.message.edit_text("❌ Ошибка при загрузке файла", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
     unique_links = processor.get_links_without_duplicates()
     duplicate_analysis = processor.get_duplicate_analysis()
 
@@ -458,8 +503,11 @@ async def on_process_unique_only(call: CallbackQuery, db: VKDatabase, vk_service
         "all_links": unique_links,
         "temp_file": session.get('temp_file'),
         "file_name": session.get('file_name'),
-        "processor": processor,
-        "file_mode": "processing"
+        "file_mode": "processing",
+        # Сохраняем данные для восстановления processor
+        "vk_column_name": processor.vk_column_name,
+        "vk_column_index": processor.vk_column_index,
+        "vk_links_mapping": processor.vk_links_mapping
     }
     await save_user_session(user_id, session_data)
 
@@ -543,13 +591,17 @@ async def on_process_after_analysis(call: CallbackQuery, db: VKDatabase, vk_serv
         )
         return
 
-    # Обновляем сессию с processor
+    # Обновляем сессию
     session["links"] = vk_links
     session["links_order"] = vk_links
     session["results"] = {}
-    session["processor"] = processor  # Важно: сохраняем processor
     session["all_links"] = vk_links
     session["file_mode"] = "processing"
+    # Сохраняем данные для processor
+    session["vk_column_name"] = processor.vk_column_name
+    session["vk_column_index"] = processor.vk_column_index
+    session["vk_links_mapping"] = processor.vk_links_mapping
+
     await save_user_session(user_id, session)
 
     # Используем информацию о дубликатах из анализа
