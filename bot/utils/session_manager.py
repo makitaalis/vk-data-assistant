@@ -65,7 +65,7 @@ def serialize_session(session_data: Dict[str, Any]) -> str:
         else:
             clean_data[key] = value
 
-    return json.dumps(clean_data, ensure_ascii=False)
+    return json.dumps(clean_data, ensure_ascii=False, default=str)
 
 
 def deserialize_session(session_str: str) -> Dict[str, Any]:

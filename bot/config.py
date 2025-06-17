@@ -63,8 +63,18 @@ RETRY_DELAY = 0.3     # Уменьшена с 1 до 0.3 сек - быстрые
 MAX_RETRIES = 1       # Уменьшено с 3 до 1 - меньше повторов для скорости
 
 # ===== Patterns =====
-VK_LINK_PATTERN = r'https?://(?:www\.)?(?:vk\.com|m\.vk\.com)/(?:id\d+|[a-zA-Z0-9_\.]+)'
-PHONE_PATTERN = r'(?<!\d)7\d{10}(?!\d)'
+# УЛУЧШЕННЫЙ паттерн для VK ссылок с поддержкой всех форматов
+VK_LINK_PATTERN = r'https?://(?:www\.)?(?:vk\.com|m\.vk\.com|vkontakte\.ru)/(?:id\d+|[a-zA-Z0-9_\.\-]+)(?:[?#][^\s<>"\'\n\r]*)?'
+
+# Альтернативные паттерны для разных случаев
+VK_LINK_PATTERNS = {
+    'standard': r'https?://(?:www\.)?(?:vk\.com|m\.vk\.com)/(?:id\d+|[a-zA-Z0-9_\.\-]+)',
+    'with_params': r'https?://(?:www\.)?(?:vk\.com|m\.vk\.com)/(?:id\d+|[a-zA-Z0-9_\.\-]+)(?:\?[^\s<>"\'\n\r]*)?',
+    'old_domain': r'https?://(?:www\.)?vkontakte\.ru/(?:id\d+|[a-zA-Z0-9_\.\-]+)',
+    'flexible': VK_LINK_PATTERN
+}
+
+PHONE_PATTERN = r'(?<!\d)(?:7|8|9)\d{10}(?!\d)'
 
 # ===== Redis Keys =====
 REDIS_SESSION_PREFIX = "session:"
@@ -75,6 +85,7 @@ REDIS_DISCLAIMER_TTL = 2592000  # 30 дней
 # ===== Feature Flags =====
 USE_REDIS = True  # Использовать Redis для сессий
 ENABLE_DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+ENABLE_DUPLICATE_REMOVAL = True  # Включить функцию удаления дубликатов
 
 # ===== Rate Limiting =====
 RATE_LIMIT_MESSAGES = 30  # Максимум сообщений в минуту от пользователя

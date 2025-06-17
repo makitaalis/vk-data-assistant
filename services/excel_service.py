@@ -1,11 +1,12 @@
-"""Сервис для работы с Excel файлами"""
+"""Сервис для работы с Excel файлами с поддержкой анализа дубликатов"""
 
 import pandas as pd
 import re
 import logging
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 from pathlib import Path
 import json
+from collections import Counter, OrderedDict
 
 from bot.config import VK_LINK_PATTERN
 
@@ -13,13 +14,15 @@ logger = logging.getLogger("excel_service")
 
 
 class ExcelProcessor:
-    """Класс для интеллектуальной обработки Excel файлов"""
+    """Класс для интеллектуальной обработки Excel файлов с анализом дубликатов"""
 
     def __init__(self):
         self.original_df = None
         self.vk_column_index = None
         self.vk_column_name = None
         self.vk_links_mapping = {}  # {link: row_index}
+        self.all_links_found = []  # Все найденные ссылки (с дубликатами)
+        self.duplicate_analysis = None  # Результаты анализа дубликатов
 
     def find_vk_column(self, df: pd.DataFrame) -> Optional[Tuple[int, str]]:
         """
@@ -55,17 +58,15 @@ class ExcelProcessor:
         Загружает Excel файл и извлекает ссылки VK
 
         Возвращает:
-        - Список ссылок VK
+        - Список уникальных ссылок VK (в порядке первого появления)
         - Список индексов строк для каждой ссылки
         - Успешность операции
         """
         try:
             # Читаем файл БЕЗ принудительного преобразования в строки
-            # Это позволит pandas автоматически определить типы данных
             self.original_df = pd.read_excel(file_path)
 
             # Но для столбца с VK ссылками нужно убедиться что они строки
-            # Преобразуем все столбцы в строки только для поиска VK ссылок
             df_for_search = self.original_df.astype(str)
 
             logger.info(f"📊 Загружен файл: {self.original_df.shape[0]} строк, {self.original_df.shape[1]} столбцов")
@@ -77,21 +78,40 @@ class ExcelProcessor:
 
             self.vk_column_index, self.vk_column_name = column_info
 
-            # Извлекаем ссылки и запоминаем их позиции
-            links = []
-            row_indices = []
-            self.vk_links_mapping = {}
+            # Извлекаем ВСЕ ссылки (включая дубликаты) и запоминаем их позиции
+            self.all_links_found = []
+            links_with_rows = []  # [(link, row_index), ...]
 
             for idx, row in self.original_df.iterrows():
                 # Для VK ссылок используем строковое представление
                 value = str(row[self.vk_column_name]).strip()
-                if re.match(VK_LINK_PATTERN, value):
-                    links.append(value)
-                    row_indices.append(idx)
-                    self.vk_links_mapping[value] = idx
 
-            logger.info(f"✅ Извлечено {len(links)} VK ссылок")
-            return links, row_indices, True
+                # Ищем ВСЕ VK ссылки в ячейке (может быть несколько)
+                matches = re.findall(VK_LINK_PATTERN, value)
+                for match in matches:
+                    self.all_links_found.append(match)
+                    links_with_rows.append((match, idx))
+
+            # Создаем упорядоченный список уникальных ссылок (сохраняя порядок первого появления)
+            seen = set()
+            unique_links = []
+            row_indices = []
+            self.vk_links_mapping = {}
+
+            for link, row_idx in links_with_rows:
+                if link not in seen:
+                    seen.add(link)
+                    unique_links.append(link)
+                    row_indices.append(row_idx)
+                    self.vk_links_mapping[link] = row_idx
+
+            # Анализируем дубликаты
+            self.duplicate_analysis = self._analyze_duplicates()
+
+            logger.info(f"✅ Найдено {len(self.all_links_found)} VK ссылок (включая дубликаты)")
+            logger.info(f"✅ Уникальных ссылок: {len(unique_links)}")
+
+            return unique_links, row_indices, True
 
         except Exception as e:
             logger.error(f"❌ Ошибка при загрузке файла: {e}")
@@ -111,17 +131,101 @@ class ExcelProcessor:
                 str_value = str(value).strip()
                 if str_value and str_value != 'nan':
                     total_non_empty += 1
-                    if re.match(VK_LINK_PATTERN, str_value):
+                    # Проверяем есть ли VK ссылка в значении
+                    if re.search(VK_LINK_PATTERN, str_value):
                         vk_links_count += 1
 
-            # Если более 50% непустых значений - это VK ссылки
+            # Если более 50% непустых значений содержат VK ссылки
             if total_non_empty > 0 and (vk_links_count / total_non_empty) > 0.5:
                 logger.info(f"✅ Найден столбец со ссылками: '{col_name}' (индекс {col_idx})")
-                logger.info(f"   Содержит {vk_links_count} VK ссылок из {total_non_empty} значений")
+                logger.info(f"   Содержит VK ссылки в {vk_links_count} ячейках из {total_non_empty}")
                 return col_idx, col_name
 
         logger.warning("❌ Столбец со ссылками VK не найден")
         return None
+
+    def _analyze_duplicates(self) -> Dict[str, Any]:
+        """
+        Анализирует дубликаты в найденных ссылках
+        """
+        if not self.all_links_found:
+            return {
+                'total_links': 0,
+                'unique_links': 0,
+                'duplicate_count': 0,
+                'duplicate_percent': 0,
+                'duplicates': {},
+                'duplicate_rows': {}
+            }
+
+        # Подсчет частоты каждой ссылки
+        link_counter = Counter(self.all_links_found)
+
+        # Находим дубликаты (ссылки встречающиеся более 1 раза)
+        duplicates = {link: count for link, count in link_counter.items() if count > 1}
+
+        # Находим строки с дубликатами
+        duplicate_rows = {}
+        for idx, row in self.original_df.iterrows():
+            value = str(row[self.vk_column_name]).strip()
+            matches = re.findall(VK_LINK_PATTERN, value)
+
+            for match in matches:
+                if match in duplicates:
+                    if match not in duplicate_rows:
+                        duplicate_rows[match] = []
+                    duplicate_rows[match].append(idx + 2)  # +2 для Excel (1-based + заголовок)
+
+        total = len(self.all_links_found)
+        unique = len(link_counter)
+        duplicate_count = total - unique
+        duplicate_percent = (duplicate_count / total * 100) if total > 0 else 0
+
+        return {
+            'total_links': total,
+            'unique_links': unique,
+            'duplicate_count': duplicate_count,
+            'duplicate_percent': duplicate_percent,
+            'duplicates': duplicates,
+            'duplicate_rows': duplicate_rows,
+            'top_duplicates': sorted(duplicates.items(), key=lambda x: x[1], reverse=True)[:10] if duplicates else []
+        }
+
+    def get_duplicate_analysis(self) -> Dict[str, Any]:
+        """
+        Возвращает результаты анализа дубликатов
+        """
+        if self.duplicate_analysis is None:
+            self.duplicate_analysis = self._analyze_duplicates()
+        return self.duplicate_analysis
+
+    def remove_duplicates_keep_first(self) -> Tuple[List[str], List[int]]:
+        """
+        Удаляет дубликаты, оставляя первое вхождение каждой ссылки
+
+        Возвращает:
+        - Список уникальных ссылок
+        - Список индексов строк
+        """
+        seen = set()
+        unique_links = []
+        row_indices = []
+
+        for link in self.all_links_found:
+            if link not in seen:
+                seen.add(link)
+                unique_links.append(link)
+                if link in self.vk_links_mapping:
+                    row_indices.append(self.vk_links_mapping[link])
+
+        return unique_links, row_indices
+
+    def get_links_without_duplicates(self) -> List[str]:
+        """
+        Возвращает список уникальных ссылок без дубликатов
+        """
+        # Используем OrderedDict для сохранения порядка
+        return list(OrderedDict.fromkeys(self.all_links_found))
 
     def save_results_with_original_data(
             self,
@@ -255,114 +359,20 @@ class ExcelProcessor:
             logger.error(traceback.format_exc())
             return False
 
-    def save_results_to_excel(
-            self,
-            results: Dict[str, Dict[str, Any]],
-            output_path: Path,
-            keep_only_with_data: bool = False
-    ) -> bool:
-        """
-        Сохраняет результаты обратно в Excel, добавляя новые столбцы
-
-        Args:
-            results: Словарь {ссылка: {phones, full_name, birth_date}}
-            output_path: Путь для сохранения файла
-            keep_only_with_data: Если True, сохраняет только строки с найденными данными
-        """
-        try:
-            if self.original_df is None:
-                logger.error("❌ Нет загруженного файла")
-                return False
-
-            # Создаем копию оригинального DataFrame
-            result_df = self.original_df.copy()
-
-            # Определяем позицию для новых столбцов (после последнего существующего)
-            insert_position = len(result_df.columns)
-
-            # Подготавливаем новые столбцы
-            new_columns = {
-                'Телефон 1': {},
-                'Телефон 2': {},
-                'Телефон 3': {},
-                'Телефон 4': {},
-                'Полное имя': {},
-                'Дата рождения': {}
-            }
-
-            # Заполняем данные для каждой строки
-            rows_with_data = set()
-
-            for link, data in results.items():
-                if link in self.vk_links_mapping:
-                    row_idx = self.vk_links_mapping[link]
-
-                    # Телефоны
-                    phones = data.get('phones', [])
-                    for i in range(4):
-                        col_name = f'Телефон {i + 1}'
-                        new_columns[col_name][row_idx] = phones[i] if i < len(phones) else ''
-
-                    # Полное имя и дата рождения
-                    new_columns['Полное имя'][row_idx] = data.get('full_name', '')
-                    new_columns['Дата рождения'][row_idx] = data.get('birth_date', '')
-
-                    # Отмечаем строки с данными
-                    if phones or data.get('full_name') or data.get('birth_date'):
-                        rows_with_data.add(row_idx)
-
-            # Добавляем новые столбцы к DataFrame
-            for col_name in ['Телефон 1', 'Телефон 2', 'Телефон 3', 'Телефон 4', 'Полное имя', 'Дата рождения']:
-                # Создаем пустой столбец
-                result_df[col_name] = ''
-
-                # Заполняем данными где они есть
-                col_data = new_columns[col_name]
-                for row_idx, value in col_data.items():
-                    if row_idx in result_df.index:
-                        result_df.at[row_idx, col_name] = value
-
-            # Если нужно оставить только строки с данными
-            if keep_only_with_data and rows_with_data:
-                result_df = result_df.loc[result_df.index.isin(rows_with_data)]
-                logger.info(f"📊 Оставлено {len(result_df)} строк с найденными данными")
-
-            # Сохраняем результат
-            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                result_df.to_excel(writer, index=False)
-
-                # Автоподбор ширины столбцов
-                worksheet = writer.sheets['Sheet1']
-                for column in worksheet.columns:
-                    max_length = 0
-                    column = [cell for cell in column]
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
-
-            logger.info(f"✅ Результаты сохранены в {output_path}")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка при сохранении результатов: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
     def get_file_info(self) -> Dict[str, Any]:
         """Возвращает информацию о загруженном файле"""
         if self.original_df is None:
             return {}
+
+        duplicate_info = self.get_duplicate_analysis()
 
         return {
             "total_rows": len(self.original_df),
             "total_columns": len(self.original_df.columns),
             "vk_column": self.vk_column_name,
             "vk_links_count": len(self.vk_links_mapping),
+            "total_links_found": duplicate_info['total_links'],
+            "duplicate_count": duplicate_info['duplicate_count'],
+            "duplicate_percent": duplicate_info['duplicate_percent'],
             "columns": list(self.original_df.columns)
         }

@@ -1,4 +1,4 @@
-"""Обработчики для работы с файлами"""
+"""Обработчики для работы с файлами с поддержкой анализа дубликатов"""
 
 import logging
 import tempfile
@@ -8,14 +8,15 @@ import pandas as pd
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 
-from bot.config import ADMIN_IDS, MAX_LINKS_PER_FILE
+from bot.config import ADMIN_IDS, MAX_LINKS_PER_FILE, ENABLE_DUPLICATE_REMOVAL
 from bot.handlers.search import start_processing
-from bot.keyboards.inline import duplicate_actions_kb
 from bot.keyboards.inline import (
+    duplicate_actions_kb,
     main_menu_kb,
     back_to_menu_kb,
     file_action_menu_kb,
-    analysis_results_kb
+    analysis_results_kb,
+    file_duplicates_menu_kb
 )
 from bot.utils.messages import MESSAGES
 from bot.utils.session_manager import (
@@ -68,33 +69,69 @@ async def handle_excel_file(msg: Message, bot):
     path_in = temp_dir / msg.document.file_name
     await bot.download(msg.document.file_id, destination=path_in)
 
+    # Используем ExcelProcessor для первичного анализа
+    processor = ExcelProcessor()
+    links, row_indices, success = processor.load_excel_file(path_in)
+
+    if not success or not links:
+        await msg.answer(
+            MESSAGES["error_no_vk_links"],
+            reply_markup=main_menu_kb(user_id, ADMIN_IDS)
+        )
+        return
+
+    # Получаем анализ дубликатов
+    duplicate_analysis = processor.get_duplicate_analysis()
+    file_info = processor.get_file_info()
+
     # Сохраняем информацию о файле в сессию
     session = {
         'temp_file': str(path_in),
         'file_name': msg.document.file_name,
-        'file_mode': 'pending'
+        'file_mode': 'pending',
+        'processor': processor,
+        'duplicate_analysis': duplicate_analysis,
+        'file_info': file_info
     }
     await save_user_session(user_id, session)
 
-    # Быстрая проверка размера файла
-    try:
-        df = pd.read_excel(path_in, nrows=1)
-        total_rows = len(pd.read_excel(path_in))
+    # Проверяем, превышает ли количество ссылок лимит
+    if duplicate_analysis['total_links'] > MAX_LINKS_PER_FILE:
+        await msg.answer(
+            MESSAGES["error_file_too_large"].format(
+                total=duplicate_analysis['total_links'],
+                max_links=MAX_LINKS_PER_FILE
+            ),
+            reply_markup=main_menu_kb(user_id, ADMIN_IDS)
+        )
+        return
 
-        if total_rows > MAX_LINKS_PER_FILE:
-            await msg.answer(MESSAGES["error_file_too_large"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
-            return
+    # Показываем информацию о файле с учетом дубликатов
+    if ENABLE_DUPLICATE_REMOVAL and duplicate_analysis['duplicate_count'] > 0:
+        # Если есть дубликаты внутри файла, показываем расширенную информацию
+        prompt_text = MESSAGES["file_with_duplicates"].format(
+            filename=msg.document.file_name,
+            total_links=duplicate_analysis['total_links'],
+            unique_links=duplicate_analysis['unique_links'],
+            duplicate_count=duplicate_analysis['duplicate_count'],
+            duplicate_percent=duplicate_analysis['duplicate_percent']
+        )
 
-    except Exception:
-        total_rows = "неизвестно"
+        # Добавляем информацию о топ дубликатах
+        if duplicate_analysis['top_duplicates']:
+            top_text = "\n\n<b>🔝 Топ дубликатов:</b>\n"
+            for i, (link, count) in enumerate(duplicate_analysis['top_duplicates'][:3], 1):
+                top_text += f"{i}. <code>{link}</code> - {count} раз\n"
+            prompt_text += top_text
 
-    # Показываем меню действий
-    prompt_text = MESSAGES["file_action_prompt"].format(
-        filename=msg.document.file_name,
-        size=total_rows
-    )
-
-    await msg.answer(prompt_text, reply_markup=file_action_menu_kb())
+        await msg.answer(prompt_text, reply_markup=file_duplicates_menu_kb())
+    else:
+        # Стандартное меню если дубликатов нет
+        prompt_text = MESSAGES["file_action_prompt"].format(
+            filename=msg.document.file_name,
+            size=duplicate_analysis['unique_links']
+        )
+        await msg.answer(prompt_text, reply_markup=file_action_menu_kb())
 
 
 async def handle_db_load(msg: Message, db: VKDatabase):
@@ -254,17 +291,22 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         return
 
     file_path = Path(session['temp_file'])
+    processor = session.get('processor')
 
-    # Используем ExcelProcessor
-    processor = ExcelProcessor()
-    links, row_indices, success = processor.load_excel_file(file_path)
+    if not processor:
+        # Если processor не сохранен, создаем новый
+        processor = ExcelProcessor()
+        links, row_indices, success = processor.load_excel_file(file_path)
 
-    if not success or not links:
-        await call.message.edit_text(
-            MESSAGES["error_no_vk_links"],
-            reply_markup=main_menu_kb(user_id, ADMIN_IDS)
-        )
-        return
+        if not success or not links:
+            await call.message.edit_text(
+                MESSAGES["error_no_vk_links"],
+                reply_markup=main_menu_kb(user_id, ADMIN_IDS)
+            )
+            return
+    else:
+        # Используем сохраненный processor
+        links = processor.get_links_without_duplicates()
 
     # НОВОЕ: Проверяем баланс перед обработкой
     from bot.handlers.balance import check_balance_before_processing
@@ -338,6 +380,125 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         # Запускаем обработку
         await call.message.edit_text(f"📤 Начинаю обработку {len(links)} ссылок...")
         await start_processing(call.message, links, processor, duplicate_check, user_id, db, vk_service, bot)
+
+
+@router.callback_query(F.data == "process_with_duplicates")
+async def on_process_with_duplicates(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+    """Обработка файла со всеми дубликатами"""
+    await call.answer("📤 Обрабатываю все ссылки...")
+    user_id = call.from_user.id
+    session = await get_user_session(user_id)
+
+    if not session or not session.get('processor'):
+        await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    processor = session['processor']
+    all_links = processor.all_links_found  # Все ссылки включая дубликаты
+
+    # Проверяем баланс
+    from bot.handlers.balance import check_balance_before_processing
+    if not await check_balance_before_processing(call.message, len(all_links), vk_service):
+        return
+
+    # Подготавливаем данные для обработки
+    session_data = {
+        "links": all_links,
+        "links_order": all_links,
+        "results": {},
+        "all_links": all_links,
+        "temp_file": session.get('temp_file'),
+        "file_name": session.get('file_name'),
+        "processor": processor,
+        "file_mode": "processing"
+    }
+    await save_user_session(user_id, session_data)
+
+    await call.message.edit_text(f"📤 Начинаю обработку {len(all_links)} ссылок (включая дубликаты)...")
+    await start_processing(call.message, all_links, processor, {}, user_id, db, vk_service, bot)
+
+
+@router.callback_query(F.data == "process_unique_only")
+async def on_process_unique_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+    """Обработка только уникальных ссылок"""
+    await call.answer("🔍 Удаляю дубликаты...")
+    user_id = call.from_user.id
+    session = await get_user_session(user_id)
+
+    if not session or not session.get('processor'):
+        await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    processor = session['processor']
+    unique_links = processor.get_links_without_duplicates()
+    duplicate_analysis = processor.get_duplicate_analysis()
+
+    # Показываем что было удалено
+    await call.message.edit_text(
+        MESSAGES["duplicates_removed"].format(
+            removed_count=duplicate_analysis['duplicate_count'],
+            unique_count=len(unique_links)
+        )
+    )
+
+    # Небольшая задержка для показа сообщения
+    import asyncio
+    await asyncio.sleep(1.5)
+
+    # Проверяем баланс
+    from bot.handlers.balance import check_balance_before_processing
+    if not await check_balance_before_processing(call.message, len(unique_links), vk_service):
+        return
+
+    # Подготавливаем данные для обработки
+    session_data = {
+        "links": unique_links,
+        "links_order": unique_links,
+        "results": {},
+        "all_links": unique_links,
+        "temp_file": session.get('temp_file'),
+        "file_name": session.get('file_name'),
+        "processor": processor,
+        "file_mode": "processing"
+    }
+    await save_user_session(user_id, session_data)
+
+    await call.message.edit_text(f"📤 Начинаю обработку {len(unique_links)} уникальных ссылок...")
+    await start_processing(call.message, unique_links, processor, {}, user_id, db, vk_service, bot)
+
+
+@router.callback_query(F.data == "show_duplicate_details")
+async def on_show_duplicate_details(call: CallbackQuery):
+    """Показать детали дубликатов"""
+    await call.answer()
+    user_id = call.from_user.id
+    session = await get_user_session(user_id)
+
+    if not session or not session.get('duplicate_analysis'):
+        await call.message.edit_text("❌ Данные не найдены", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    duplicate_analysis = session['duplicate_analysis']
+
+    details_text = MESSAGES["duplicate_details"].format(
+        total_duplicates=duplicate_analysis['duplicate_count'],
+        unique_duplicates=len(duplicate_analysis['duplicates'])
+    )
+
+    # Добавляем информацию о топ дубликатах
+    if duplicate_analysis['top_duplicates']:
+        details_text += "\n\n<b>🔝 Топ-10 самых частых дубликатов:</b>\n\n"
+        for i, (link, count) in enumerate(duplicate_analysis['top_duplicates'], 1):
+            rows = duplicate_analysis['duplicate_rows'].get(link, [])[:5]
+            rows_text = ", ".join(map(str, rows))
+            if len(duplicate_analysis['duplicate_rows'].get(link, [])) > 5:
+                rows_text += "..."
+
+            details_text += f"{i}. <code>{link}</code>\n"
+            details_text += f"   📊 Встречается: {count} раз\n"
+            details_text += f"   📋 Строки Excel: {rows_text}\n\n"
+
+    await call.message.answer(details_text, reply_markup=back_to_menu_kb())
 
 
 @router.callback_query(F.data == "analyze_and_process")

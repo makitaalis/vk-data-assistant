@@ -441,3 +441,28 @@ async def on_cancel(call: CallbackQuery):
         MESSAGES["operation_cancelled"],
         reply_markup=main_menu_kb(user_id, ADMIN_IDS)
     )
+
+# Добавьте эти обработчики в bot/handlers/callbacks.py после существующих обработчиков:
+
+@router.callback_query(F.data == "process_with_duplicates")
+async def on_process_with_duplicates_callback(call: CallbackQuery, db, vk_service, bot):
+    """Обработка файла со всеми дубликатами"""
+    # Вызываем функцию из files.py
+    from bot.handlers.files import on_process_with_duplicates
+    await on_process_with_duplicates(call, db, vk_service, bot)
+
+
+@router.callback_query(F.data == "process_unique_only")
+async def on_process_unique_only_callback(call: CallbackQuery, db, vk_service, bot):
+    """Обработка только уникальных ссылок"""
+    # Вызываем функцию из files.py
+    from bot.handlers.files import on_process_unique_only
+    await on_process_unique_only(call, db, vk_service, bot)
+
+
+@router.callback_query(F.data == "show_duplicate_details")
+async def on_show_duplicate_details_callback(call: CallbackQuery):
+    """Показать детали дубликатов"""
+    # Вызываем функцию из files.py
+    from bot.handlers.files import on_show_duplicate_details
+    await on_show_duplicate_details(call)

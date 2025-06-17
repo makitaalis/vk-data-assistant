@@ -1,4 +1,4 @@
-"""Inline клавиатуры для бота"""
+"""Inline клавиатуры для бота с поддержкой обработки дубликатов"""
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -42,7 +42,6 @@ def main_menu_kb(user_id: int, admin_ids: list[int]) -> InlineKeyboardMarkup:
         ])
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
 
 
 def back_to_menu_kb() -> InlineKeyboardMarkup:
@@ -101,7 +100,7 @@ def finish_kb() -> InlineKeyboardMarkup:
 
 
 def duplicate_actions_kb() -> InlineKeyboardMarkup:
-    """Клавиатура для работы с дубликатами"""
+    """Клавиатура для работы с дубликатами в БД"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -128,6 +127,25 @@ def file_action_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📊 Анализ + Обработка", callback_data="analyze_and_process")
+            ],
+            [
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_file")
+            ]
+        ]
+    )
+
+
+def file_duplicates_menu_kb() -> InlineKeyboardMarkup:
+    """Меню для работы с дубликатами внутри файла"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 Удалить дубликаты", callback_data="process_unique_only"),
+                InlineKeyboardButton(text="📋 Обработать все", callback_data="process_with_duplicates")
+            ],
+            [
+                InlineKeyboardButton(text="📊 Детали дубликатов", callback_data="show_duplicate_details"),
+                InlineKeyboardButton(text="🔍 Полный анализ", callback_data="analyze_only")
             ],
             [
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_file")
