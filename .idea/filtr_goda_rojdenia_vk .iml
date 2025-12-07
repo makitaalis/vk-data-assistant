@@ -4,7 +4,7 @@
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.10 (filtr_goda_rojdenia_vk )" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.12 (BOT_Brinch_sherlock)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

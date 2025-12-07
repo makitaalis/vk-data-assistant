@@ -16,10 +16,12 @@ class AuthMiddleware(BaseMiddleware):
     ALLOWED_COMMANDS = ["/start"]
     ALLOWED_CALLBACKS = ["accept_disclaimer", "reject_disclaimer"]
 
-    def __init__(self, db, vk_service):
+    def __init__(self, db, vk_service, session_auth_manager=None, task_queue=None):
         """Инициализация с зависимостями"""
         self.db = db
         self.vk_service = vk_service
+        self.session_auth_manager = session_auth_manager
+        self.task_queue = task_queue
 
     async def __call__(
             self,
@@ -32,6 +34,10 @@ class AuthMiddleware(BaseMiddleware):
         # Добавляем зависимости в data
         data["db"] = self.db
         data["vk_service"] = self.vk_service
+        if self.session_auth_manager:
+            data["session_auth_manager"] = self.session_auth_manager
+        if self.task_queue:
+            data["task_queue"] = self.task_queue
 
         # Получаем user_id
         user = None

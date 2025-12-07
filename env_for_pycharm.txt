@@ -1,0 +1,17 @@
+# Скопируйте это содержимое в файл .env в PyCharm
+
+# Telegram API Configuration
+# Получите на https://my.telegram.org
+API_ID=23690277
+API_HASH=a95df6666bc0bc570891b5114b702cd1
+
+# Session Configuration  
+# Имя файла сессии (будет создан автоматически)
+SESSION_NAME=user_session
+
+# Ваш номер телефона для авторизации в Telegram
+# Формат: +XXXXXXXXXXX
+ACCOUNT_PHONE=+380936884294
+
+# VK Bot Configuration (для тестирования)
+VK_BOT_USERNAME=EFGR_SherlockSearchbot

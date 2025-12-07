@@ -46,6 +46,11 @@ async def init_redis():
         redis_client = None
 
 
+def get_redis() -> Optional[redis.Redis]:
+    """Получение глобального клиента Redis"""
+    return redis_client
+
+
 def serialize_session(session_data: Dict[str, Any]) -> str:
     """Сериализация сессии для сохранения"""
     # Создаем копию данных для сериализации
@@ -64,9 +69,17 @@ def serialize_session(session_data: Dict[str, Any]) -> str:
             clean_data[key] = str(value)
         # Для duplicate_check сохраняем только необходимые данные
         elif key == 'duplicate_check' and isinstance(value, dict):
+            duplicates_with_data = value.get('duplicates_with_data', {})
+            if isinstance(duplicates_with_data, dict):
+                duplicates_with_data = list(duplicates_with_data.keys())
+            elif isinstance(duplicates_with_data, list):
+                duplicates_with_data = duplicates_with_data
+            else:
+                duplicates_with_data = []
+
             clean_data[key] = {
                 'new': value.get('new', []),
-                'duplicates_with_data': list(value.get('duplicates_with_data', {}).keys()),
+                'duplicates_with_data': duplicates_with_data,
                 'duplicates_no_data': value.get('duplicates_no_data', []),
                 'stats': value.get('stats', {})
             }
@@ -118,12 +131,18 @@ async def save_user_session(user_id: int, session_data: Dict[str, Any]):
         except Exception as e:
             logger.error(f"❌ Ошибка записи в Redis: {e}")
             logger.error(f"Данные сессии: {list(session_data.keys())}")
-            # Падаем на локальное хранилище
-            local_sessions[user_id] = session_data
+            # Падаем на локальное хранилище с сериализацией, чтобы данные оставались совместимыми
+            try:
+                local_sessions[user_id] = deserialize_session(serialize_session(session_data))
+            except Exception:
+                local_sessions[user_id] = {}
             return
 
     # Fallback на локальное хранилище
-    local_sessions[user_id] = session_data
+    try:
+        local_sessions[user_id] = deserialize_session(serialize_session(session_data))
+    except Exception:
+        local_sessions[user_id] = {}
 
 
 async def clear_user_session(user_id: int):

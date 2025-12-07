@@ -1,0 +1,29 @@
+[
+  {
+    "timestamp": "2025-08-30T07:04:24.856659",
+    "bot_username": "Sherlok_sherlock_bot",
+    "message_id": 156304,
+    "text": "🔎 **Идёт поиск, пожалуйста, подождите...**",
+    "raw_text": "🔎 Идёт поиск, пожалуйста, подождите...",
+    "entities": "[<telethon.tl.types.MessageEntityBold object at 0x7fda61c8f040>]",
+    "buttons": null
+  },
+  {
+    "timestamp": "2025-08-30T07:04:30.018229",
+    "bot_username": "Sherlok_sherlock_bot",
+    "message_id": 156306,
+    "text": "🔎 **Идёт поиск, пожалуйста, подождите...**",
+    "raw_text": "🔎 Идёт поиск, пожалуйста, подождите...",
+    "entities": "[<telethon.tl.types.MessageEntityBold object at 0x7fda61c8d600>]",
+    "buttons": null
+  },
+  {
+    "timestamp": "2025-08-30T07:04:35.224394",
+    "bot_username": "Sherlok_sherlock_bot",
+    "message_id": 156308,
+    "text": "🔎 **Идёт поиск, пожалуйста, подождите...**",
+    "raw_text": "🔎 Идёт поиск, пожалуйста, подождите...",
+    "entities": "[<telethon.tl.types.MessageEntityBold object at 0x7fda61c8e1a0>]",
+    "buttons": null
+  }
+]

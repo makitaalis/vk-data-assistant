@@ -89,14 +89,14 @@ class FileAnalyzer:
         """Генерирует рекомендации на основе анализа"""
         recommendations = []
 
-        # Рекомендации по дубликатам
-        total_vk = len(duplicate_vk.get("new", [])) + len(duplicate_vk.get("duplicates_with_data", {})) + len(
-            duplicate_vk.get("duplicates_no_data", []))
-        if total_vk > 0:
-            duplicate_percent = ((len(duplicate_vk.get("duplicates_with_data", {})) + len(
-                duplicate_vk.get("duplicates_no_data", []))) / total_vk) * 100
-            if duplicate_percent > 50:
-                recommendations.append(f"🔄 {int(duplicate_percent)}% ссылок уже в базе - рекомендую удалить дубликаты")
+        # ОТКЛЮЧЕНО: Рекомендации по дубликатам (проверка на дубликаты отключена)
+        # total_vk = len(duplicate_vk.get("new", [])) + len(duplicate_vk.get("duplicates_with_data", {})) + len(
+        #     duplicate_vk.get("duplicates_no_data", []))
+        # if total_vk > 0:
+        #     duplicate_percent = ((len(duplicate_vk.get("duplicates_with_data", {})) + len(
+        #         duplicate_vk.get("duplicates_no_data", []))) / total_vk) * 100
+        #     if duplicate_percent > 50:
+        #         recommendations.append(f"🔄 {int(duplicate_percent)}% ссылок уже в базе - рекомендую удалить дубликаты")
 
         # Рекомендации по телефонам
         if network['stats']['phones_with_multiple_vk'] > 5:
@@ -121,21 +121,17 @@ class FileAnalyzer:
         stats = analysis['stats']
         network = analysis['network']['stats']
         duplicates = analysis['duplicates']
+        duplicates_vk = duplicates.get('vk', {})
 
-        # Получаем статистику из нового формата
-        vk_stats = duplicates['vk'].get('stats', {})
+        duplicate_vk_with_data = len(duplicates_vk.get('duplicates_with_data', {}))
+        duplicate_vk_no_data = len(duplicates_vk.get('duplicates_no_data', []))
+        duplicate_phone_links = len(duplicates_vk.get('duplicate_phones', {}))
 
-        # Подсчет дубликатов
-        duplicate_vk_count = vk_stats.get('duplicate_by_vk', 0) + vk_stats.get('duplicate_by_both', 0)
-        duplicate_phones_count = vk_stats.get('duplicate_by_phone', 0) + vk_stats.get('duplicate_by_both', 0)
-        duplicate_vk_with_data = len(duplicates['vk'].get('duplicates_with_data', {}))
+        # Пользовательское сообщение больше не показывает статистику по дубликатам
+        duplicates_text = ""
 
-        # Форматирование рекомендаций
+        # Рекомендации скрываем для конечных пользователей
         recommendations_text = ""
-        if analysis['recommendations']:
-            recommendations_text = MESSAGES["recommendations"].format(
-                items="\n".join(f"• {rec}" for rec in analysis['recommendations'])
-            )
 
         return MESSAGES["analysis_complete"].format(
             filename=analysis['basic']['file_name'],
@@ -144,9 +140,7 @@ class FileAnalyzer:
             data_rows=stats.get('rows_with_vk_links', 0) + stats.get('rows_with_phones', 0),
             phones_multiple_vk=network.get('phones_with_multiple_vk', 0),
             vk_multiple_phones=network.get('vk_with_multiple_phones', 0),
-            duplicate_vk=duplicate_vk_count,
-            duplicate_vk_with_data=duplicate_vk_with_data,
-            duplicate_phones=duplicate_phones_count,
+            duplicates=duplicates_text,
             recommendations=recommendations_text
         )
 

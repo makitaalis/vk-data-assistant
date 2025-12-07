@@ -6,5 +6,6 @@ from . import files
 from . import admin
 from . import callbacks
 from . import stats
+from . import session_auth
 
-__all__ = ["start", "search", "files", "admin", "callbacks", "stats"]
+__all__ = ["start", "search", "files", "admin", "callbacks", "stats", "session_auth"]

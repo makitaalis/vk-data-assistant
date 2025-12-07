@@ -1,14 +1,16 @@
 """Вспомогательные функции"""
 
-import re
 import logging
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
+from uuid import uuid4
 
 from aiogram import types
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.config import VK_LINK_PATTERN
+from bot.config import VK_LINK_PATTERN, TEMP_DIR
 
 logger = logging.getLogger("helpers")
 
@@ -159,6 +161,26 @@ def calculate_eta(processed: int, total: int, elapsed_seconds: float) -> int:
         return int(remaining / speed)
 
     return 0
+
+
+def create_temp_dir(prefix: str = "tmp") -> Path:
+    """Создает уникальную временную директорию в каталоге TEMP_DIR"""
+    for _ in range(5):
+        dir_path = TEMP_DIR / f"{prefix}_{uuid4().hex}"
+        try:
+            dir_path.mkdir(parents=True, exist_ok=False)
+            return dir_path
+        except FileExistsError:
+            continue
+
+    raise RuntimeError("Не удалось создать временную директорию")
+
+
+def prepare_temp_file(filename: str, prefix: str = "tmp") -> Path:
+    """Возвращает путь к временному файлу в каталоге TEMP_DIR"""
+    base_name = Path(filename).name or "tmp_file"
+    temp_dir = create_temp_dir(prefix)
+    return temp_dir / base_name
 
 
 def format_file_size(size_bytes: int) -> str:

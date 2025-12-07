@@ -1,7 +1,6 @@
 """Обработчики для работы с файлами с поддержкой анализа дубликатов"""
 
 import logging
-import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +23,7 @@ from bot.utils.session_manager import (
     clear_user_session,
     save_user_session
 )
+from bot.utils.helpers import prepare_temp_file
 from db_loader import DatabaseLoader
 from db_module import VKDatabase
 from services.analysis_service import FileAnalyzer
@@ -65,8 +65,7 @@ async def handle_excel_file(msg: Message, bot):
     user_id = msg.from_user.id
 
     # Создаем временную папку и скачиваем файл
-    temp_dir = Path(tempfile.mkdtemp())
-    path_in = temp_dir / msg.document.file_name
+    path_in = prepare_temp_file(msg.document.file_name, prefix="upload")
     await bot.download(msg.document.file_id, destination=path_in)
 
     # Используем ExcelProcessor для первичного анализа
@@ -111,25 +110,41 @@ async def handle_excel_file(msg: Message, bot):
         )
         return
 
+    is_admin = user_id in ADMIN_IDS
+    logger.info(
+        "📁 Файл загружен пользователем %s (admin=%s): duplicates=%s",
+        user_id,
+        is_admin,
+        duplicate_analysis['duplicate_count']
+    )
+
     # Показываем информацию о файле с учетом дубликатов
     if ENABLE_DUPLICATE_REMOVAL and duplicate_analysis['duplicate_count'] > 0:
         # Если есть дубликаты внутри файла, показываем расширенную информацию
-        prompt_text = MESSAGES["file_with_duplicates"].format(
-            filename=msg.document.file_name,
-            total_links=duplicate_analysis['total_links'],
-            unique_links=duplicate_analysis['unique_links'],
-            duplicate_count=duplicate_analysis['duplicate_count'],
-            duplicate_percent=duplicate_analysis['duplicate_percent']
+        if is_admin:
+            prompt_text = MESSAGES["file_with_duplicates"].format(
+                filename=msg.document.file_name,
+                total_links=duplicate_analysis['total_links'],
+                unique_links=duplicate_analysis['unique_links'],
+                duplicate_count=duplicate_analysis['duplicate_count'],
+                duplicate_percent=duplicate_analysis['duplicate_percent']
+            )
+
+            # Добавляем информацию о топ дубликатах
+            if duplicate_analysis['top_duplicates']:
+                top_text = "\n\n<b>🔝 Топ дубликатов:</b>\n"
+                for i, (link, count) in enumerate(duplicate_analysis['top_duplicates'][:3], 1):
+                    top_text += f"{i}. <code>{link}</code> - {count} раз\n"
+                prompt_text += top_text
+        else:
+            prompt_text = MESSAGES["file_with_duplicates_user"].format(
+                filename=msg.document.file_name
+            )
+
+        await msg.answer(
+            prompt_text,
+            reply_markup=file_duplicates_menu_kb(is_admin=is_admin)
         )
-
-        # Добавляем информацию о топ дубликатах
-        if duplicate_analysis['top_duplicates']:
-            top_text = "\n\n<b>🔝 Топ дубликатов:</b>\n"
-            for i, (link, count) in enumerate(duplicate_analysis['top_duplicates'][:3], 1):
-                top_text += f"{i}. <code>{link}</code> - {count} раз\n"
-            prompt_text += top_text
-
-        await msg.answer(prompt_text, reply_markup=file_duplicates_menu_kb())
     else:
         # Стандартное меню если дубликатов нет
         prompt_text = MESSAGES["file_action_prompt"].format(
@@ -164,8 +179,7 @@ async def handle_db_load(msg: Message, db: VKDatabase):
 
         try:
             # Скачиваем файл
-            temp_dir = Path(tempfile.mkdtemp())
-            file_path = temp_dir / doc.file_name
+            file_path = prepare_temp_file(doc.file_name, prefix="db_upload")
             await msg.bot.download(doc.file_id, destination=file_path)
 
             # Загружаем в БД
@@ -255,6 +269,11 @@ async def on_analyze_only(call: CallbackQuery, db: VKDatabase):
         )
 
         analysis = await analyzer.analyze_file(file_path)
+        vk_links_from_analysis = [
+            record['link']
+            for record in analysis.get('records', [])
+            if isinstance(record.get('link'), str) and not record['link'].startswith('phone:')
+        ]
 
         await progress_msg.edit_text(
             MESSAGES["analysis_in_progress"].format(
@@ -270,11 +289,31 @@ async def on_analyze_only(call: CallbackQuery, db: VKDatabase):
 
         # Сохраняем результаты анализа в сессию
         session['analysis_result'] = analysis
+        session['duplicate_check'] = analysis['duplicates']['vk']
         session['file_mode'] = 'analyzed'
+        if vk_links_from_analysis:
+            session['cached_links'] = vk_links_from_analysis
+            session['links'] = vk_links_from_analysis
+            session['links_order'] = vk_links_from_analysis
+            session['force_search_available'] = True
         await save_user_session(user_id, session)
 
+        # Определяем, есть ли дубликаты
+        vk_duplicates_stats = analysis["duplicates"]["vk"].get("stats", {})
+        total_duplicates = (
+            vk_duplicates_stats.get("duplicate_by_vk", 0)
+            + vk_duplicates_stats.get("duplicate_by_phone", 0)
+            + vk_duplicates_stats.get("duplicate_by_both", 0)
+        )
+
         # Показываем результаты
-        await progress_msg.edit_text(result_text, reply_markup=analysis_results_kb())
+        await progress_msg.edit_text(
+            result_text,
+            reply_markup=analysis_results_kb(
+                is_admin=user_id in ADMIN_IDS,
+                has_duplicates=total_duplicates > 0
+            )
+        )
 
     except Exception as e:
         logger.error(f"Ошибка при анализе файла: {e}")
@@ -289,6 +328,7 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
     """Обработка файла без анализа"""
     await call.answer("📤 Начинаю обработку...")
     user_id = call.from_user.id
+    is_admin = user_id in ADMIN_IDS
     session = await get_user_session(user_id)
 
     if not session or not session.get('temp_file'):
@@ -306,11 +346,6 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
             MESSAGES["error_no_vk_links"],
             reply_markup=main_menu_kb(user_id, ADMIN_IDS)
         )
-        return
-
-    # НОВОЕ: Проверяем баланс перед обработкой
-    from bot.handlers.balance import check_balance_before_processing
-    if not await check_balance_before_processing(call.message, len(links), vk_service):
         return
 
     # НОВОЕ: Извлекаем телефоны из файла для проверки дубликатов
@@ -339,13 +374,41 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
         "vk_column_index": processor.vk_column_index,
         "vk_links_mapping": processor.vk_links_mapping
     }
-    await save_user_session(user_id, session_data)
 
-    # Проверяем дубликаты с учетом телефонов
-    duplicate_check = await db.check_duplicates_extended(links, phones_map)
+    # Проверяем дубликаты с учетом телефонов через БД
+    duplicate_check = {
+        "new": list(links),
+        "duplicates_with_data": {},
+        "duplicates_no_data": [],
+        "duplicate_phones": {},
+        "stats": {
+            "total": len(links),
+            "duplicate_by_vk": 0,
+            "duplicate_by_phone": 0,
+            "duplicate_by_both": 0,
+            "new": len(links)
+        }
+    }
+
+    if db:
+        try:
+            duplicate_check = await db.check_duplicates_extended(links, phones_map)
+        except Exception as err:
+            logger.error(f"Не удалось выполнить проверку дубликатов: {err}")
+
+    # Гарантированно обновляем счетчик новых ссылок
+    stats = duplicate_check.get("stats", {})
+    stats.setdefault("new", len(duplicate_check.get("new", [])))
+    stats.setdefault("duplicate_by_vk", 0)
+    stats.setdefault("duplicate_by_phone", 0)
+    stats.setdefault("duplicate_by_both", 0)
+    duplicate_check["stats"] = stats
 
     # Если есть дубликаты, показываем анализ
     total = len(links)
+    session_data["duplicate_check"] = duplicate_check
+    await save_user_session(user_id, session_data)
+
     stats = duplicate_check["stats"]
 
     # Считаем общее количество дубликатов
@@ -353,32 +416,18 @@ async def on_process_only(call: CallbackQuery, db: VKDatabase, vk_service, bot):
 
     if total_duplicates > 0:
         # Подсчитываем дубликаты с данными
-        with_data_count = len(duplicate_check["duplicates_with_data"])
-        no_data_count = len(duplicate_check["duplicates_no_data"])
+        with_data_count = len(duplicate_check.get("duplicates_with_data", {}))
+        no_data_count = len(duplicate_check.get("duplicates_no_data", []))
 
-        analysis_text = f"""📊 <b>Анализ файла завершен!</b>
+        analysis_text = (
+            "📁 Файл готов к обработке.\n\n"
+            "Вы можете продолжить обработку ссылок."
+        )
 
-📁 Файл: <code>{session.get('file_name', 'файл')}</code>
-
-<b>📊 Статистика VK ссылок:</b>
-- Всего: {total}
-- Новых: {stats['new']}
-- Дубликатов по VK: {stats['duplicate_by_vk'] + stats['duplicate_by_both']}
-
-<b>📱 Статистика телефонов:</b>
-- Дубликатов по телефонам: {stats['duplicate_by_phone'] + stats['duplicate_by_both']}
-
-<b>📋 Итого дубликатов: {total_duplicates}</b>
-- С данными: {with_data_count}
-- Без данных: {no_data_count + len(duplicate_check.get('duplicate_phones', {}))}
-
-<b>Что делать с дубликатами?</b>"""
-
-        await call.message.edit_text(analysis_text, reply_markup=duplicate_actions_kb())
-
-        # Сохраняем duplicate_check
-        session_data["duplicate_check"] = duplicate_check
-        await save_user_session(user_id, session_data)
+        await call.message.edit_text(
+            analysis_text,
+            reply_markup=duplicate_actions_kb(is_admin=is_admin)
+        )
     else:
         # Запускаем обработку
         await call.message.edit_text(f"📤 Начинаю обработку {len(links)} ссылок...")
@@ -454,6 +503,11 @@ async def on_process_unique_only(call: CallbackQuery, db: VKDatabase, vk_service
     """Обработка только уникальных ссылок"""
     await call.answer("🔍 Удаляю дубликаты...")
     user_id = call.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        await call.answer("🚫 Доступ только для администраторов", show_alert=True)
+        return
+
     session = await get_user_session(user_id)
 
     # Проверяем наличие файла
@@ -490,11 +544,6 @@ async def on_process_unique_only(call: CallbackQuery, db: VKDatabase, vk_service
     import asyncio
     await asyncio.sleep(1.5)
 
-    # Проверяем баланс
-    from bot.handlers.balance import check_balance_before_processing
-    if not await check_balance_before_processing(call.message, len(unique_links), vk_service):
-        return
-
     # Подготавливаем данные для обработки
     session_data = {
         "links": unique_links,
@@ -520,6 +569,11 @@ async def on_show_duplicate_details(call: CallbackQuery):
     """Показать детали дубликатов"""
     await call.answer()
     user_id = call.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        await call.answer("🚫 Доступ только для администраторов", show_alert=True)
+        return
+
     session = await get_user_session(user_id)
 
     if not session or not session.get('duplicate_analysis'):
@@ -547,6 +601,73 @@ async def on_show_duplicate_details(call: CallbackQuery):
             details_text += f"   📋 Строки Excel: {rows_text}\n\n"
 
     await call.message.answer(details_text, reply_markup=back_to_menu_kb())
+
+
+@router.callback_query(F.data == "process_without_cache")
+async def on_process_without_cache(call: CallbackQuery, db: VKDatabase, vk_service, bot):
+    """Обработка файла без использования кеша (принудительная проверка)"""
+    await call.answer("🔄 Запускаю обработку без кеша...")
+    user_id = call.from_user.id
+    session = await get_user_session(user_id)
+
+    if not session or not session.get('temp_file'):
+        await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    file_path = Path(session['temp_file'])
+    if not file_path.exists():
+        await call.message.edit_text("❌ Файл не найден", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    # Проверяем, что сервисы доступны
+    if not db or not vk_service:
+        await call.message.edit_text("❌ Сервис временно недоступен", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    # Загружаем файл через processor
+    processor = ExcelProcessor()
+    processor.load_excel_file(file_path)
+
+    if not processor.vk_links_mapping:
+        await call.message.edit_text("❌ В файле не найдены VK ссылки", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+        return
+
+    # Получаем все уникальные ссылки
+    all_links = list(processor.vk_links_mapping.keys())
+
+    # Проверяем баланс
+    from bot.handlers.balance import check_balance_before_processing
+    if not await check_balance_before_processing(call.message, len(all_links), len(all_links), vk_service):
+        return
+
+    # Сохраняем данные в сессию
+    session['links'] = all_links
+    session['links_order'] = all_links
+    session['processor'] = processor
+    session['vk_links_mapping'] = processor.vk_links_mapping
+    session['vk_column_name'] = processor.vk_column_name
+    session['force_no_cache'] = True  # Флаг для игнорирования кеша
+    await save_user_session(user_id, session)
+
+    # Запускаем принудительную проверку без кеша
+    await call.message.edit_text(
+        f"🔄 <b>Запускаю обработку без кеша</b>\n\n"
+        f"📊 Будет проверено: {len(all_links)} ссылок\n"
+        f"⚠️ Кеш будет игнорирован и обновлен новыми данными\n"
+        f"⏳ Это может занять некоторое время..."
+    )
+
+    # Используем функцию принудительного поиска без кеша
+    from bot.handlers.search import force_search_without_cache
+    await force_search_without_cache(
+        call.message,
+        all_links,
+        processor,
+        user_id,
+        db,
+        vk_service,
+        bot
+    )
 
 
 @router.callback_query(F.data == "analyze_and_process")
@@ -601,6 +722,8 @@ async def on_process_after_analysis(call: CallbackQuery, db: VKDatabase, vk_serv
     session["vk_column_name"] = processor.vk_column_name
     session["vk_column_index"] = processor.vk_column_index
     session["vk_links_mapping"] = processor.vk_links_mapping
+    session["cached_links"] = vk_links
+    session["force_search_available"] = False
 
     await save_user_session(user_id, session)
 

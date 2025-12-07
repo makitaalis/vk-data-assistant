@@ -1,17 +1,68 @@
 """Функции для экспорта результатов в различные форматы"""
 import json
 
-import pandas as pd
-import tempfile
 import logging
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+
+import pandas as pd
 
 from bot.config import EXPORT_DATE_FORMAT, EXPORT_COLUMN_WIDTHS
 from bot.utils.messages import MESSAGES
+from bot.utils.helpers import create_temp_dir
+from services.excel_service import ExcelProcessor
 
 logger = logging.getLogger("export")
+
+
+def restore_processor_from_session(session: Optional[dict]) -> Optional[ExcelProcessor]:
+    """
+    Переинициализирует ExcelProcessor по данным из пользовательской сессии.
+    Возвращает None, если исходный файл недоступен или испорчен.
+    """
+    if not session:
+        return None
+
+    temp_file = session.get("temp_file")
+    if not temp_file:
+        return None
+
+    file_path = Path(temp_file)
+    if not file_path.exists():
+        logger.warning("Исходный файл %s недоступен", file_path)
+        return None
+
+    processor = ExcelProcessor()
+    links, _, success = processor.load_excel_file(file_path)
+    if not success or not links:
+        logger.warning("Не удалось загрузить файл %s для повторного экспорта", file_path)
+        return None
+
+    mapping = session.get("vk_links_mapping")
+    if isinstance(mapping, dict):
+        normalized = {}
+        for link, rows in mapping.items():
+            if rows is None:
+                continue
+            if isinstance(rows, list):
+                cleaned = []
+                for row in rows:
+                    try:
+                        cleaned.append(int(row))
+                    except (TypeError, ValueError):
+                        continue
+                if cleaned:
+                    normalized[link] = cleaned
+            else:
+                try:
+                    normalized[link] = [int(rows)]
+                except (TypeError, ValueError):
+                    continue
+        if normalized:
+            processor.vk_links_mapping = normalized
+
+    return processor
 
 
 async def create_excel_from_results(
@@ -21,7 +72,7 @@ async def create_excel_from_results(
     """
     Создает Excel файл из результатов поиска
     """
-    temp_dir = Path(tempfile.mkdtemp())
+    temp_dir = create_temp_dir(prefix="export")
     ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
     path_result = temp_dir / f"vk_data_{ts}.xlsx"
 
@@ -46,12 +97,13 @@ async def create_excel_from_results(
         # Подготавливаем данные для DataFrame
         data_for_df = []
 
-        # Определяем максимальное количество телефонов
+        # Определяем максимальное количество телефонов (но выводим не более двух)
         max_phones = 0
         for result_data in all_results.values():
             phones = result_data.get("phones", [])
             if isinstance(phones, list):
                 max_phones = max(max_phones, len(phones))
+        max_phones = min(max_phones, 2) if max_phones else 2
 
         # Создаем данные для каждой ссылки
         for link in links_order:
@@ -72,10 +124,16 @@ async def create_excel_from_results(
             elif not isinstance(phones, list):
                 phones = []
 
-            phones = [str(p) for p in phones if p]
+            phones = [str(p) for p in phones if p][:2]
+
+            # Извлекаем ФИО и дату рождения
+            full_name = result_data.get("full_name", "")
+            birth_date = result_data.get("birth_date", "")
 
             # Создаем строку с ссылкой и телефонами
             row_data = {"Ссылка VK": link}
+            row_data["ФИО"] = full_name
+            row_data["Дата рождения"] = birth_date
 
             # Добавляем телефоны в отдельные столбцы
             for i in range(max_phones):
@@ -99,6 +157,10 @@ async def create_excel_from_results(
 
                 if column_title == "Ссылка VK":
                     worksheet.column_dimensions[column_letter].width = 50
+                elif column_title == "ФИО":
+                    worksheet.column_dimensions[column_letter].width = 30
+                elif column_title == "Дата рождения":
+                    worksheet.column_dimensions[column_letter].width = 15
                 elif column_title.startswith("Телефон"):
                     worksheet.column_dimensions[column_letter].width = 15
 
@@ -124,6 +186,43 @@ async def create_excel_from_results(
     return files_to_return
 
 
+async def prepare_result_files(
+        processor,
+        results: Dict[str, Dict[str, Any]],
+        links_order: List[str]
+) -> List[Tuple[Path, str]]:
+    """
+    Создает список файлов с результатами, используя оригинальный Excel, если он доступен.
+    """
+    # Стараемся сохранить оригинальную структуру файла, если загруженный Excel доступен
+    try:
+        if processor and getattr(processor, "original_df", None) is not None:
+            temp_dir = create_temp_dir(prefix="export")
+            ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
+            output_path = temp_dir / f"vk_data_complete_{ts}.xlsx"
+
+            success = processor.save_results_with_original_data(results, output_path)
+            if success:
+                found_count = sum(1 for data in results.values() if data.get("phones"))
+                not_found_count = len(links_order) - found_count
+
+                caption = (
+                    "📊 Файл с результатами готов!\n\n"
+                    f"✅ Обработано: {len(links_order)} ссылок\n"
+                    f"📱 Найдены телефоны: {found_count}\n"
+                    f"❌ Без телефонов: {not_found_count}\n\n"
+                    "💾 Все исходные данные сохранены!"
+                )
+                return [(output_path, caption)]
+            else:
+                logger.warning("Не удалось сохранить результаты с исходными данными, используем стандартный экспорт.")
+    except Exception as exc:
+        logger.error(f"Ошибка при формировании файла с исходными данными: {exc}")
+
+    # Фолбэк: стандартный экспорт без исходных данных
+    return await create_excel_from_results(results, links_order)
+
+
 async def create_json_report(data: Dict[str, Any], filename_prefix: str = "report") -> Path:
     """
     Создает JSON отчет
@@ -137,7 +236,7 @@ async def create_json_report(data: Dict[str, Any], filename_prefix: str = "repor
     """
     import json
 
-    temp_dir = Path(tempfile.mkdtemp())
+    temp_dir = create_temp_dir(prefix="export")
     ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
     json_path = temp_dir / f"{filename_prefix}_{ts}.json"
 
@@ -163,7 +262,7 @@ async def export_statistics_report(stats: Dict[str, Any]) -> Path:
     Returns:
         Path к файлу
     """
-    temp_dir = Path(tempfile.mkdtemp())
+    temp_dir = create_temp_dir(prefix="export")
     ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
     path = temp_dir / f"statistics_{ts}.xlsx"
 
@@ -209,7 +308,7 @@ async def create_excel_with_original_data(
     """
     Создает Excel файл с исходными данными и добавленными телефонами
     """
-    temp_dir = Path(tempfile.mkdtemp())
+    temp_dir = create_temp_dir(prefix="export")
     ts = datetime.now().strftime(EXPORT_DATE_FORMAT)
     files_to_return = []
 

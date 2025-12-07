@@ -1,0 +1,19 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Local data/log directories (keep placeholders if present)
+data/
+!data/.gitkeep
+data_backup/
+!data_backup/.gitkeep
+debug/
+!debug/.gitkeep
+logs/
+!logs/.gitkeep
+exports/
+backups/

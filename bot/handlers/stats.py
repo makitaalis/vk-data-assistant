@@ -39,11 +39,32 @@ async def cmd_user_stats(msg: Message, db: VKDatabase):
 
 
 @router.message(Command("status"))
-async def cmd_status(msg: Message):
+async def cmd_status(msg: Message, task_queue=None):
     """Проверка текущего статуса обработки"""
     user_id = msg.from_user.id
 
-    # Импортируем здесь чтобы избежать циклических импортов
+    if task_queue:
+        stats = await task_queue.user_stats(user_id)
+        recent = await task_queue.recent_results(user_id, limit=5)
+        lines = [
+            "📊 <b>Статус очереди</b>",
+            f"Pending: {stats.get('pending', 0)}",
+            f"Processing: {stats.get('processing', 0)}",
+            f"Done: {stats.get('done', 0)}",
+            f"Failed: {stats.get('failed', 0)}",
+            f"Cancelled: {stats.get('cancelled', 0)}",
+        ]
+        if recent:
+            lines.append("\nПоследние задачи:")
+            for row in recent:
+                status = row.get("status")
+                link = row.get("link")
+                err = row.get("error")
+                lines.append(f"• {status}: {link}" + (f" — {err}" if err else ""))
+        await msg.answer("\n".join(lines), reply_markup=back_to_menu_kb())
+        return
+
+    # Старый путь (in-memory), если очередь выключена
     from bot.utils.session_manager import get_user_session
     from bot.utils.helpers import create_progress_bar, format_time
     from bot.keyboards.inline import processing_menu_kb, finish_kb
@@ -58,10 +79,8 @@ async def cmd_status(msg: Message):
     results = session.get("results", {})
     processed = len(results)
 
-    # Правильный подсчет статистики
     found = 0
     not_found = 0
-
     for data in results.values():
         if data.get("phones") or data.get("full_name") or data.get("birth_date"):
             found += 1
@@ -69,7 +88,6 @@ async def cmd_status(msg: Message):
             not_found += 1
 
     pending = total - processed
-
     progress_bar = create_progress_bar(processed, total)
     percent = int((processed / total) * 100) if total > 0 else 0
 
@@ -88,28 +106,33 @@ async def cmd_status(msg: Message):
 
 
 @router.message(Command("export"))
-async def cmd_export(msg: Message, bot):
-    """Экспорт результатов текущей сессии"""
+async def cmd_export(msg: Message, bot, task_queue=None):
+    """Экспорт результатов текущей сессии или из очереди"""
     user_id = msg.from_user.id
 
     from bot.utils.session_manager import get_user_session
     from bot.utils.export import create_excel_from_results
 
-    session = await get_user_session(user_id)
+    results_dict = {}
+    links_order = []
 
-    if not session:
-        await msg.answer(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
-        return
+    if task_queue:
+        results_dict = await task_queue.user_results(user_id)
+        links_order = list(results_dict.keys())
 
-    all_results = session.get("results", {})
-    links_order = session.get("links_order", [])
+    if not results_dict:
+        session = await get_user_session(user_id)
+        if not session:
+            await msg.answer(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+            return
+        results_dict = session.get("results", {})
+        links_order = session.get("links_order", [])
 
     if not links_order:
         await msg.answer(MESSAGES["no_session"], reply_markup=main_menu_kb(user_id, ADMIN_IDS))
         return
 
-    # Генерируем файл с результатами
-    files = await create_excel_from_results(all_results, links_order)
+    files = await create_excel_from_results(results_dict, links_order)
 
     for file_path, caption in files:
         try:
@@ -128,13 +151,11 @@ async def cmd_export(msg: Message, bot):
 
 @router.message(Command("cancel"))
 async def cmd_cancel(msg: Message):
-    """Отмена текущей операции"""
-    user_id = msg.from_user.id
-
-    from bot.utils.session_manager import clear_user_session
-    await clear_user_session(user_id)
-
-    await msg.answer("🚫 Обработка отменена. Все данные очищены.", reply_markup=main_menu_kb(user_id, ADMIN_IDS))
+    """Команда отключена"""
+    await msg.answer(
+        "Команда /cancel отключена. Используйте паузу или главное меню для управления обработкой.",
+        reply_markup=main_menu_kb(msg.from_user.id, ADMIN_IDS),
+    )
 
 
 @router.callback_query(F.data == "user_stats")

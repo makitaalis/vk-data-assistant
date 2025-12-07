@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple, Optional, Any, Set
 from pathlib import Path
 import json
 from collections import Counter, OrderedDict
+from openpyxl.styles import Alignment
 
 from bot.config import VK_LINK_PATTERN
 
@@ -20,7 +21,7 @@ class ExcelProcessor:
         self.original_df = None
         self.vk_column_index = None
         self.vk_column_name = None
-        self.vk_links_mapping = {}  # {link: row_index}
+        self.vk_links_mapping = {}  # {link: [row_index, ...]}
         self.all_links_found = []  # Все найденные ссылки (с дубликатами)
         self.duplicate_analysis = None  # Результаты анализа дубликатов
 
@@ -81,6 +82,7 @@ class ExcelProcessor:
             # Извлекаем ВСЕ ссылки (включая дубликаты) и запоминаем их позиции
             self.all_links_found = []
             links_with_rows = []  # [(link, row_index), ...]
+            self.vk_links_mapping = {}
 
             for idx, row in self.original_df.iterrows():
                 # Для VK ссылок используем строковое представление
@@ -91,19 +93,17 @@ class ExcelProcessor:
                 for match in matches:
                     self.all_links_found.append(match)
                     links_with_rows.append((match, idx))
+                    self.vk_links_mapping.setdefault(match, []).append(idx)
 
             # Создаем упорядоченный список уникальных ссылок (сохраняя порядок первого появления)
             seen = set()
             unique_links = []
             row_indices = []
-            self.vk_links_mapping = {}
-
             for link, row_idx in links_with_rows:
                 if link not in seen:
                     seen.add(link)
                     unique_links.append(link)
                     row_indices.append(row_idx)
-                    self.vk_links_mapping[link] = row_idx
 
             # Анализируем дубликаты
             self.duplicate_analysis = self._analyze_duplicates()
@@ -215,8 +215,8 @@ class ExcelProcessor:
             if link not in seen:
                 seen.add(link)
                 unique_links.append(link)
-                if link in self.vk_links_mapping:
-                    row_indices.append(self.vk_links_mapping[link])
+                if link in self.vk_links_mapping and self.vk_links_mapping[link]:
+                    row_indices.append(self.vk_links_mapping[link][0])
 
         return unique_links, row_indices
 
@@ -233,122 +233,75 @@ class ExcelProcessor:
             output_path: Path
     ) -> bool:
         """
-        Сохраняет результаты, добавляя ТОЛЬКО телефоны к исходным данным
+        Сохраняет результаты, добавляя найденные телефоны к исходным данным без их перезаписи
         """
         try:
             if self.original_df is None:
                 logger.error("❌ Нет загруженного файла")
                 return False
 
-            # Создаем копию оригинального DataFrame
             result_df = self.original_df.copy()
 
-            # Определяем максимальное количество телефонов
-            max_phones = 0
-            for data in results.values():
-                phones = data.get('phones', [])
-                if isinstance(phones, list):
-                    max_phones = max(max_phones, len(phones))
+            target_column = "Найденные телефоны"
+            if target_column not in result_df.columns:
+                result_df[target_column] = ""
+            else:
+                result_df[target_column] = result_df[target_column].fillna("")
 
-            # Если телефонов нет, добавляем хотя бы один столбец
-            if max_phones == 0:
-                max_phones = 1
-
-            # Добавляем столбцы для телефонов
-            for i in range(max_phones):
-                col_name = f'Телефон{i + 1}'
-                result_df[col_name] = ''
-
-            # Заполняем данные для каждой строки
             for link, data in results.items():
-                if link in self.vk_links_mapping:
-                    row_idx = self.vk_links_mapping[link]
+                rows = self.vk_links_mapping.get(link)
+                if rows is None:
+                    continue
 
-                    # Извлекаем телефоны
-                    phones = data.get('phones', [])
-                    if phones is None:
-                        phones = []
-                    elif isinstance(phones, str):
-                        if phones.startswith('['):
-                            try:
-                                phones = json.loads(phones)
-                            except:
-                                phones = []
-                        else:
-                            phones = [phones] if phones else []
-                    elif not isinstance(phones, list):
-                        phones = []
+                if not isinstance(rows, list):
+                    rows = [rows]
 
-                    # Убедимся что элементы списка - строки
-                    phones = [str(p) for p in phones if p]
+                phones = self._extract_phone_list(data)
+                if not phones:
+                    continue
+                phones = phones[:2]
+                if not phones:
+                    continue
 
-                    # Добавляем телефоны в соответствующие столбцы
-                    for i, phone in enumerate(phones):
-                        if i < max_phones:
-                            col_name = f'Телефон{i + 1}'
-                            result_df.at[row_idx, col_name] = phone
+                for row_idx in rows:
+                    if row_idx >= len(result_df):
+                        continue
+                    existing_value = result_df.at[row_idx, target_column]
+                    existing_items = []
+                    if pd.notna(existing_value):
+                        existing_items = [
+                            item.strip()
+                            for item in str(existing_value).replace("\n", ",").split(",")
+                            if item.strip()
+                        ]
 
-            # Сохраняем результат с правильным форматированием
+                    combined = list(OrderedDict.fromkeys(existing_items + phones))[:2]
+                    result_df.at[row_idx, target_column] = ", ".join(combined)
+
             with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
                 result_df.to_excel(writer, index=False, sheet_name='Результаты')
-
-                # Получаем worksheet
                 worksheet = writer.sheets['Результаты']
 
-                # Проходим по всем ячейкам и устанавливаем формат
-                for row in worksheet.iter_rows():
-                    for cell in row:
-                        # Если это заголовок, пропускаем
-                        if cell.row == 1:
-                            continue
+                header_row = 1
 
-                        # Для телефонных столбцов устанавливаем текстовый формат
-                        if cell.column_letter and worksheet.cell(1, cell.column).value and 'Телефон' in str(
-                                worksheet.cell(1, cell.column).value):
-                            # Устанавливаем формат как текст
-                            cell.number_format = '@'
-                            # Если значение есть, преобразуем в строку
-                            if cell.value:
-                                cell.value = str(cell.value)
-                        else:
-                            # Для остальных ячеек пытаемся сохранить исходный тип
-                            if cell.value is not None:
-                                # Пробуем преобразовать в число если это возможно
-                                try:
-                                    # Проверяем, является ли значение числом
-                                    if str(cell.value).replace('.', '').replace(',', '').replace('-', '').isdigit():
-                                        # Если нет букв, пробуем преобразовать
-                                        if '.' in str(cell.value) or ',' in str(cell.value):
-                                            cell.value = float(str(cell.value).replace(',', '.'))
-                                        else:
-                                            # Проверяем, не телефон ли это (11 цифр начиная с 7 или 8)
-                                            if len(str(cell.value)) == 11 and str(cell.value)[0] in ['7', '8']:
-                                                cell.number_format = '@'  # Текстовый формат для телефонов
-                                            else:
-                                                cell.value = int(str(cell.value))
-                                except:
-                                    # Если не получилось преобразовать, оставляем как есть
-                                    pass
-
-                # Автоподбор ширины столбцов
                 for column in worksheet.columns:
-                    max_length = 0
-                    column_cells = [cell for cell in column]
+                    column_letter = column[0].column_letter
+                    header_value = worksheet.cell(row=header_row, column=column[0].column)
 
-                    for cell in column_cells:
-                        try:
-                            if cell.value:
-                                max_length = max(max_length, len(str(cell.value)))
-                        except:
-                            pass
-
-                    # Устанавливаем ширину
-                    column_letter = column_cells[0].column_letter
-                    if column_cells[0].value and 'Телефон' in str(column_cells[0].value):
-                        worksheet.column_dimensions[column_letter].width = 15
+                    if header_value.value == target_column:
+                        worksheet.column_dimensions[column_letter].width = 30
+                        for cell in column:
+                            cell.alignment = Alignment(wrap_text=True, vertical="top")
+                            cell.number_format = "@"
                     else:
-                        adjusted_width = min(max_length + 2, 50)
-                        worksheet.column_dimensions[column_letter].width = adjusted_width
+                        max_length = 0
+                        for cell in column:
+                            try:
+                                if cell.value is not None:
+                                    max_length = max(max_length, len(str(cell.value)))
+                            except Exception:
+                                continue
+                        worksheet.column_dimensions[column_letter].width = min(max_length + 2, 50)
 
             logger.info(f"✅ Результаты сохранены в {output_path} с исходными данными")
             return True
@@ -376,3 +329,104 @@ class ExcelProcessor:
             "duplicate_percent": duplicate_info['duplicate_percent'],
             "columns": list(self.original_df.columns)
         }
+
+    def _extract_phone_list(self, result_data: Dict[str, Any]) -> List[str]:
+        """Вытаскивает список телефонов из результата и приводит к строковому виду"""
+        phones = result_data.get("phones", [])
+
+        if phones is None:
+            phones = []
+        elif isinstance(phones, str):
+            if phones.startswith('['):
+                try:
+                    phones = json.loads(phones)
+                except Exception:
+                    phones = []
+            else:
+                phones = [phones] if phones else []
+        elif not isinstance(phones, list):
+            phones = []
+
+        normalized = OrderedDict()
+        for phone in phones:
+            candidate = str(phone).strip()
+            if candidate:
+                normalized[candidate] = None
+
+        return list(normalized.keys())
+
+    def update_results_from_dict(self, results: Dict[str, Dict[str, Any]]):
+        """
+        Обновляет исходный DataFrame результатами поиска
+        Добавляет колонки для телефонов, имен и дат рождения
+        """
+        if self.original_df is None:
+            logger.error("❌ Нет загруженного DataFrame для обновления")
+            return
+
+        try:
+            # Создаем копию для работы
+            df = self.original_df.copy()
+            
+            # Определяем максимальное количество телефонов для создания колонок
+            max_phones = max(
+                len(data.get('phones', [])) 
+                for data in results.values() 
+                if isinstance(data.get('phones'), list)
+            ) if results else 0
+            max_phones = min(max_phones, 2)
+            
+            # Создаем колонки для телефонов если нужно
+            phone_columns = []
+            for i in range(max_phones):
+                col_name = f"Phone_{i+1}" if i > 0 else "Phone"
+                if col_name not in df.columns:
+                    df[col_name] = ""
+                phone_columns.append(col_name)
+            
+            # Создаем колонки для других данных если нужно
+            if "Full_Name" not in df.columns:
+                df["Full_Name"] = ""
+            if "Birth_Date" not in df.columns:
+                df["Birth_Date"] = ""
+            
+            # Обновляем данные для каждой ссылки
+            updated_count = 0
+            for link, data in results.items():
+                if link not in self.vk_links_mapping:
+                    continue
+
+                row_indices = self.vk_links_mapping.get(link) or []
+                if not isinstance(row_indices, list):
+                    row_indices = [row_indices]
+
+                # Обновляем телефоны
+                phones = data.get('phones', [])
+                phone_values = phones if isinstance(phones, list) else []
+                phone_values = phone_values[:2]
+
+                # Обновляем имя/дату
+                full_name = data.get('full_name', '').strip()
+                birth_date = data.get('birth_date', '').strip()
+
+                for row_idx in row_indices:
+                    for i, phone in enumerate(phone_values[:max_phones]):
+                        if i < len(phone_columns):
+                            df.at[row_idx, phone_columns[i]] = phone
+
+                    if full_name:
+                        df.at[row_idx, "Full_Name"] = full_name
+                    if birth_date:
+                        df.at[row_idx, "Birth_Date"] = birth_date
+
+                updated_count += 1
+            
+            # Обновляем исходный DataFrame
+            self.original_df = df
+            logger.info(f"✅ DataFrame обновлен результатами для {updated_count} ссылок")
+            logger.info(f"   Добавлено колонок: Phone({max_phones}), Full_Name, Birth_Date")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обновлении DataFrame: {e}")
+            import traceback
+            logger.error(traceback.format_exc())

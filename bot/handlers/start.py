@@ -94,3 +94,9 @@ async def on_send_links(call: CallbackQuery):
     """Обработчик кнопки отправки ссылок"""
     await call.answer()
     await call.message.edit_text(MESSAGES["send_links"], reply_markup=back_to_menu_kb())
+
+
+@router.callback_query(F.data == "main_menu_separator")
+async def on_menu_separator(call: CallbackQuery):
+    """Игнорирование декоративного разделителя"""
+    await call.answer()

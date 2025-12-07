@@ -5,10 +5,11 @@ import logging
 from typing import Optional
 
 from aiogram import Router, F
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.config import ADMIN_IDS
-from bot.keyboards.inline import main_menu_kb, processing_menu_kb
+from bot.config import ADMIN_IDS, VK_BOT_USERNAME, BALANCE_LIMIT_CHECK_ENABLED
+from bot.keyboards.inline import main_menu_kb, processing_menu_kb, insufficient_balance_kb
 from bot.utils.session_manager import get_user_session
 from bot.utils.helpers import create_progress_bar, format_time
 from bot.utils.messages import MESSAGES
@@ -21,28 +22,63 @@ processing_paused = False
 balance_check_lock = asyncio.Lock()
 
 
+@router.message(Command("balance"))
+async def cmd_balance(msg: Message, vk_service):
+    """Обработчик команды /balance - получает актуальный баланс через меню бота"""
+    
+    # Отправляем сообщение о проверке
+    primary_bot = (VK_BOT_USERNAME or "").lstrip("@") or "sherlock_bot_ne_bot"
+    status_msg = await msg.answer(
+        f"🔄 Подключаюсь к @{primary_bot} для проверки баланса..."
+    )
+    
+    try:
+        # Получаем баланс через новый метод (через меню бота)
+        balance_overview = await vk_service.get_balance_overview()
+
+        from bot.keyboards.inline import back_to_menu_kb
+        await status_msg.edit_text(
+            balance_overview,
+            reply_markup=back_to_menu_kb()
+        )
+            
+    except Exception as e:
+        logger.error(f"Ошибка при проверке баланса: {e}")
+        from bot.keyboards.inline import back_to_menu_kb
+        await status_msg.edit_text(
+            "❌ Ошибка при проверке баланса.\n"
+            f"Детали: {str(e)}",
+            reply_markup=back_to_menu_kb()
+        )
+
+
 @router.callback_query(F.data == "check_balance")
 async def on_check_balance(call: CallbackQuery, vk_service):
-    """Обработчик кнопки Баланс в главном меню"""
-    await call.answer("🔄 Проверяю баланс...")
+    """Обработчик кнопки Баланс в главном меню - получает актуальный баланс через меню бота"""
+    await call.answer("🔄 Получаю актуальный баланс...")
 
     try:
-        balance = await vk_service.check_balance()
+        primary_bot = (VK_BOT_USERNAME or "").lstrip("@") or "sherlock_bot_ne_bot"
+        await call.message.edit_text(
+            f"🔄 Подключаюсь к @{primary_bot} для проверки баланса..."
+        )
 
-        if balance is not None:
-            # Формируем сообщение
-            if balance < 100:
-                balance_text = f"💰 Доступно поисков: {balance} ⚠️ (осталось мало)"
-            else:
-                balance_text = f"💰 Доступно поисков: {balance}"
+        balance_overview = await vk_service.get_balance_overview()
 
-            await call.message.answer(balance_text)
-        else:
-            await call.message.answer("❌ Не удалось проверить баланс, попробуйте позже")
+        from bot.keyboards.inline import back_to_menu_kb
+        await call.message.edit_text(
+            balance_overview,
+            reply_markup=back_to_menu_kb()
+        )
 
     except Exception as e:
         logger.error(f"Ошибка при проверке баланса: {e}")
-        await call.message.answer("❌ Ошибка при проверке баланса")
+        from bot.keyboards.inline import back_to_menu_kb
+        await call.message.edit_text(
+            "❌ Ошибка при проверке баланса.\n"
+            f"Детали: {str(e)}",
+            reply_markup=back_to_menu_kb()
+        )
 
 
 @router.callback_query(F.data == "check_balance_processing")
@@ -57,11 +93,15 @@ async def on_check_balance_during_processing(call: CallbackQuery, vk_service):
             # Приостанавливаем все обработки
             processing_paused = True
             logger.info("⏸ Все обработки приостановлены для проверки баланса")
+            user_id = call.from_user.id
+            session = await get_user_session(user_id) or {}
+            session["balance_pause"] = True
+            await save_user_session(user_id, session)
 
             # Ждем завершения текущих операций
             await asyncio.sleep(1.5)
 
-            # Проверяем баланс
+            # Проверяем баланс (возвращает число)
             balance = await vk_service.check_balance()
 
             if balance is not None:
@@ -117,12 +157,18 @@ async def on_check_balance_during_processing(call: CallbackQuery, vk_service):
             # Возобновляем обработку
             processing_paused = False
             logger.info("▶️ Обработки возобновлены")
+            user_id = call.from_user.id
+            session = await get_user_session(user_id) or {}
+            if session.pop("balance_pause", None):
+                await save_user_session(user_id, session)
 
 
 async def check_balance_before_processing(
     message: Message,
-    links_count: int,
-    vk_service
+    total_links: int,
+    required_checks: int,
+    vk_service,
+    allow_force: bool = False
 ) -> bool:
     """
     Проверяет достаточно ли поисков перед началом обработки
@@ -130,6 +176,9 @@ async def check_balance_before_processing(
     Returns:
         True если можно продолжать, False если недостаточно поисков
     """
+    if not BALANCE_LIMIT_CHECK_ENABLED:
+        return True
+
     try:
         status_msg = await message.answer("🔄 Проверяю доступные поиски...")
 
@@ -140,14 +189,27 @@ async def check_balance_before_processing(
             await status_msg.delete()
             return True
 
-        if balance < links_count:
+        if balance < required_checks:
             # Недостаточно поисков
-            await status_msg.edit_text(
+            already_in_cache = max(total_links - required_checks, 0)
+            message_text = (
                 f"❌ Недостаточно поисков!\n\n"
-                f"В файле: {links_count} ссылок\n"
-                f"Доступно: {balance} поисков\n\n"
-                f"Пополните баланс для обработки этого файла.",
-                reply_markup=main_menu_kb(message.from_user.id, ADMIN_IDS)
+                f"Всего ссылок: {total_links}\n"
+                f"Уже в базе: {already_in_cache}\n"
+                f"Новых проверок требуется: {required_checks}\n"
+                f"Доступно: {balance} поисков"
+            )
+
+            if allow_force:
+                message_text += "\n\nВыберите действие:"
+                markup = insufficient_balance_kb()
+            else:
+                message_text += "\n\nПополните баланс для обработки этого файла."
+                markup = main_menu_kb(message.from_user.id, ADMIN_IDS)
+
+            await status_msg.edit_text(
+                message_text,
+                reply_markup=markup
             )
             return False
 

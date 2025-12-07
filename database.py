@@ -173,6 +173,37 @@ class VKDatabase:
                 EXECUTE FUNCTION update_updated_at_column();
             """)
 
+            # Таблица задач очереди поиска
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS search_tasks (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    link TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', -- pending | processing | done | failed | cancelled
+                    session_name TEXT,
+                    position INTEGER,
+                    result JSONB,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    started_at TIMESTAMP,
+                    finished_at TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_search_tasks_status ON search_tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_search_tasks_user ON search_tasks(user_id);
+            """)
+            await conn.execute("""
+                DROP TRIGGER IF EXISTS update_search_tasks_updated_at ON search_tasks;
+                CREATE TRIGGER update_search_tasks_updated_at 
+                BEFORE UPDATE ON search_tasks 
+                FOR EACH ROW 
+                EXECUTE FUNCTION update_updated_at_column();
+            """)
+            # Бесшумное добавление позиции для старых таблиц и заполнение её id
+            await conn.execute("ALTER TABLE search_tasks ADD COLUMN IF NOT EXISTS position INTEGER;")
+            await conn.execute("UPDATE search_tasks SET position = id WHERE position IS NULL;")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_search_tasks_position ON search_tasks(user_id, position);")
+
     async def check_duplicates_extended(self, links: List[str], phones_map: Dict[str, List[str]] = None) -> Dict[
         str, Any]:
         """
@@ -471,17 +502,18 @@ class VKDatabase:
             logger.error(f"❌ Ошибка при сохранении результата для {link}: {e}")
 
     async def get_cached_results(self, links: List[str]) -> Dict[str, Dict]:
-        """Получает закешированные результаты для списка ссылок"""
+        """Получает закешированные результаты для списка ссылок (включая пустые)"""
         results = {}
 
         if not links:
             return results
 
         async with self.acquire() as conn:
+            # ВАЖНО: Убираем условие found_data = TRUE, чтобы получать ВСЕ результаты
             rows = await conn.fetch("""
-                SELECT link, phones, full_name, birth_date 
+                SELECT link, phones, full_name, birth_date, found_data 
                 FROM vk_results 
-                WHERE link = ANY($1::text[]) AND found_data = TRUE
+                WHERE link = ANY($1::text[])
             """, links)
 
             for row in rows:
@@ -500,7 +532,8 @@ class VKDatabase:
                 results[row["link"]] = {
                     "phones": phones,
                     "full_name": row["full_name"] or "",
-                    "birth_date": row["birth_date"] or ""
+                    "birth_date": row["birth_date"] or "",
+                    "found_data": row["found_data"]  # Добавляем флаг для статистики
                 }
 
         return results
@@ -713,4 +746,194 @@ class VKDatabase:
                     "birth_date": row["birth_date"] or ""
                 })
 
+            return results
+
+    # ===== Очередь задач поиска =====
+    async def add_search_tasks(self, user_id: int, links: List[str], session_name: Optional[str] = None) -> List[int]:
+        """Добавляет ссылки в очередь поиска. Возвращает список id задач."""
+        if not links:
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                INSERT INTO search_tasks (user_id, link, status, session_name, position)
+                SELECT $1, link, 'pending', $2, ord
+                FROM unnest($3::text[]) WITH ORDINALITY AS t(link, ord)
+                RETURNING id
+                """,
+                user_id,
+                session_name,
+                links,
+            )
+            return [row["id"] for row in rows]
+
+    async def fetch_next_tasks(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Забирает пачку pending задач и переводит их в processing."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    UPDATE search_tasks
+                    SET status = 'processing', started_at = NOW()
+                    WHERE id IN (
+                        SELECT id FROM search_tasks
+                        WHERE status = 'pending'
+                        ORDER BY id
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, user_id, link, session_name;
+                    """,
+                    limit,
+                )
+                return [dict(row) for row in rows]
+
+    async def complete_task(self, task_id: int, result: Dict[str, Any]):
+        """Отмечает задачу выполненной и сохраняет результат."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE search_tasks
+                SET status = 'done',
+                    finished_at = NOW(),
+                    result = $2,
+                    error = NULL
+                WHERE id = $1
+                """,
+                task_id,
+                json.dumps(result),
+            )
+
+    async def fail_task(self, task_id: int, error: str):
+        """Отмечает задачу неуспешной."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE search_tasks
+                SET status = 'failed',
+                    finished_at = NOW(),
+                    error = $2
+                WHERE id = $1
+                """,
+                task_id,
+                error[:500],
+            )
+
+    async def reset_stale_tasks(self, older_than_minutes: int = 60):
+        """Возвращает зависшие processing задачи обратно в pending."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE search_tasks
+                SET status = 'pending',
+                    started_at = NULL
+                WHERE status = 'processing'
+                  AND started_at < NOW() - ($1 || ' minutes')::interval
+                """,
+                older_than_minutes,
+            )
+
+    async def get_queue_stats(self) -> Dict[str, int]:
+        """Статистика очереди задач."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, COUNT(*) AS cnt
+                FROM search_tasks
+                GROUP BY status
+                """
+            )
+            stats = {row["status"]: row["cnt"] for row in rows}
+            for key in ("pending", "processing", "done", "failed", "cancelled"):
+                stats.setdefault(key, 0)
+            return stats
+
+    async def get_failed_summary(self, *, limit: int = 3, window_hours: int = 6) -> List[Dict[str, Any]]:
+        """Топ ошибок за заданное окно времени."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT COALESCE(NULLIF(error, ''), 'unknown') AS error, COUNT(*) AS cnt
+                FROM search_tasks
+                WHERE status = 'failed'
+                  AND finished_at > NOW() - ($1 || ' hours')::interval
+                GROUP BY error
+                ORDER BY cnt DESC, error ASC
+                LIMIT $2
+                """,
+                window_hours,
+                limit,
+            )
+            return [dict(row) for row in rows]
+
+    async def get_user_task_stats(self, user_id: int) -> Dict[str, int]:
+        """Статистика задач конкретного пользователя."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, COUNT(*) AS cnt
+                FROM search_tasks
+                WHERE user_id = $1
+                GROUP BY status
+                """,
+                user_id,
+            )
+            stats = {row["status"]: row["cnt"] for row in rows}
+            for key in ("pending", "processing", "done", "failed", "cancelled"):
+                stats.setdefault(key, 0)
+            return stats
+
+    async def cancel_user_tasks(self, user_id: int) -> int:
+        """Переводит все pending задачи пользователя в cancelled."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE search_tasks
+                SET status = 'cancelled', finished_at = NOW()
+                WHERE user_id = $1 AND status = 'pending'
+                """,
+                user_id,
+            )
+            try:
+                return int(result.split()[-1])
+            except Exception:
+                return 0
+
+    async def get_recent_results(self, user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+        """Возвращает последние результаты/ошибки пользователя."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, link, status, result, error, finished_at
+                FROM search_tasks
+                WHERE user_id = $1 AND status IN ('done','failed','cancelled')
+                ORDER BY finished_at DESC NULLS LAST, id DESC
+                LIMIT $2
+                """,
+                user_id,
+                limit,
+            )
+            return [dict(row) for row in rows]
+
+    async def get_user_results(self, user_id: int) -> Dict[str, Dict[str, Any]]:
+        """Возвращает все результаты done для пользователя, ключ — link."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT link, result
+                FROM search_tasks
+                WHERE user_id = $1 AND status = 'done'
+                ORDER BY position ASC NULLS LAST, finished_at ASC NULLS FIRST, id ASC
+                """,
+                user_id,
+            )
+            results: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                payload = row["result"] or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+                results[row["link"]] = payload
             return results
